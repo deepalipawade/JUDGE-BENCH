@@ -19,6 +19,17 @@ PROJECT_ID = "llm-juries"
 DEFAULT_LOCATION = "global"
 GOOGLE_GENAI_USE_VERTEXAI = "True"
 
+# We resuse the responses from dices_judgement_005.json for other LLM models to avoid API call again.
+# We only do API call for aggregator model as we aggregate the responses from all models and generate new response.
+
+# Panel judges whose responses are reused from the input JSON.
+MODELS = [
+    "meta/llama-3.3-70b-instruct-maas",
+    "google/gemma-4-26b-a4b-it-maas",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
 AGGREGATOR_MODEL = "google/gemma-4-26b-a4b-it-maas"
 DEFAULT_CHECKPOINT_EVERY = 5
 
@@ -203,6 +214,7 @@ def main() -> None:
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "source_input": str(args.input),
             "output_file": str(args.output),
+            "models": MODELS,
             "aggregator_model": AGGREGATOR_MODEL,
             "checkpoint_every": args.checkpoint_every,
             "n_source_records": len(records),
