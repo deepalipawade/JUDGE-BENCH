@@ -33,18 +33,9 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS_ROOT = ROOT / "results_tmp" / "memerag_ext"
 
-# Maps model ID to its LOO subfolder name — add new models here for future LOO runs
-EXCL_SUBDIR: dict[str, str] = {
-    "gemini-2.5-flash-lite":            "excl_gemini_lite",
-    "gemini-2.5-flash":                 "excl_gemini_flash",
-    "google/gemma-4-26b-a4b-it-maas":  "excl_gemma",
-    "meta/llama-3.3-70b-instruct-maas": "excl_llama",
-    "gpt-5.4-mini":                     "excl_gpt_mini",
-    "gpt-5.4-mini-2026-03-17":          "excl_gpt_mini_march",
-}
 
-SERVICE_ACCOUNT_PATH = r"C:\Users\Deepali\Downloads\llm-juries-dd7439c15063.json"
-PROJECT_ID = "llm-juries"
+SERVICE_ACCOUNT_PATH = r"C:\Users\Deepali\Downloads\Thesis\Ivaxi LLMs\llm-juries-503009-babf6fe232e6.json"
+PROJECT_ID = "llm-juries-503009"
 DEFAULT_LOCATION = "global"
 GOOGLE_GENAI_USE_VERTEXAI = "True"
 
@@ -80,8 +71,23 @@ def normalize_label(value: Any) -> str | None:
     return None
 
 
+BLABLADOR_BASE_URL = "https://api.blablador.fz-juelich.de/v1/"
+BLABLADOR_MAX_TOKENS = 6000
+
+BLABLADOR_API_IDS: dict[str, str] = {
+    "MiniMax-M2.7":  "01 - MiniMax-M2.7 - our best model as of April, 2026",
+    "GPT-OSS-120b":  "01 - GPT-OSS-120b - an open model released by OpenAI in August 2025",
+    "Qwen3.6-35B":   "08 - Qwen3.6-35B-A3B-FP8 - Multimodal model from Apr 2026",
+    "Apertus-8B":    "15 - Apertus-8B-Instruct-2509 - A new swiss model from September 2025",
+}
+
+
 def is_openai_model(model_name: str) -> bool:
     return model_name.startswith("gpt-")
+
+
+def is_blablador_model(model_name: str) -> bool:
+    return model_name in BLABLADOR_API_IDS
 
 
 def model_location_for(model_name: str) -> str:
@@ -136,6 +142,32 @@ def call_vertex(genai: Any, HttpOptions: Any, model_name: str, prompt: str) -> t
         except Exception as exc:
             err = str(exc)
             if attempt < 2 and ("429" in err or "RESOURCE_EXHAUSTED" in err):
+                time.sleep(2 ** attempt)
+                continue
+            return None, err
+    return None, "Max retries exceeded"
+
+
+def call_blablador(blablador_client: Any, api_id: str, prompt: str) -> tuple[str | None, str | None]:
+    for attempt in range(3):
+        try:
+            response = blablador_client.chat.completions.create(
+                model=api_id,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=BLABLADOR_MAX_TOKENS,
+                temperature=0,
+            )
+            text = response.choices[0].message.content
+            if text is None:
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                return None, "Empty response after retries"
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            return text, None
+        except Exception as exc:
+            err = str(exc)
+            if attempt < 2 and ("429" in err or "rate_limit" in err.lower()):
                 time.sleep(2 ** attempt)
                 continue
             return None, err
@@ -267,7 +299,7 @@ def main() -> None:
 
     input_path = args.input or (RESULTS_ROOT / args.lang / f"memerag_judgement_{args.lang}.json")
     if args.exclude:
-        excl_folder = EXCL_SUBDIR.get(args.exclude, "excl_" + args.exclude.split("/")[-1].replace(".", "_"))
+        excl_folder = "excl_" + args.exclude.split("/")[-1].lower().replace(".", "_").replace("-", "_")
         output_path = args.output or (RESULTS_ROOT / args.lang / excl_folder / f"random_aggregator_{args.lang}.json")
     else:
         output_path = args.output or (RESULTS_ROOT / args.lang / f"random_aggregator_{args.lang}.json")
@@ -325,6 +357,16 @@ def main() -> None:
     except ImportError:
         pass
 
+    # Init Blablador
+    blablador_client = None
+    try:
+        from openai import OpenAI as _OAI
+        blablador_key = os.environ.get("BLABLADOR_API_KEY")
+        if blablador_key:
+            blablador_client = _OAI(base_url=BLABLADOR_BASE_URL, api_key=blablador_key)
+    except ImportError:
+        pass
+
     completed_records = list(resume_records)
     aggregator_choice_counts: Counter = Counter()
 
@@ -372,7 +414,9 @@ def main() -> None:
 
             prompt = build_aggregator_prompt(record, eligible_models)
 
-            if is_openai_model(aggregator_model):
+            if is_blablador_model(aggregator_model):
+                raw, error = call_blablador(blablador_client, BLABLADOR_API_IDS[aggregator_model], prompt)
+            elif is_openai_model(aggregator_model):
                 raw, error = call_openai(openai_client, aggregator_model, prompt)
             else:
                 raw, error = call_vertex(genai, HttpOptions, aggregator_model, prompt)
@@ -405,10 +449,35 @@ def main() -> None:
     bacc = compute_bacc(completed_records, "__aggregator")
     kappa = compute_cohen_kappa(completed_records, "__aggregator")
 
+    # --- Results table ---
+    bacc_str  = f"{bacc:.4f}"  if bacc  is not None else "n/a"
+    kappa_str = f"{kappa:.4f}" if kappa is not None else "n/a"
+    col_w = max(len("random_aggregator"), 20)
     print(f"\nResults (seed={args.seed}, lang={args.lang}, excl={args.exclude}):")
-    print(f"  Balanced accuracy : {bacc:.4f}" if bacc is not None else "  Balanced accuracy : n/a")
-    print(f"  Cohen's kappa     : {kappa:.4f}" if kappa is not None else "  Cohen's kappa     : n/a")
-    print(f"\nAggregator selection counts: {dict(aggregator_choice_counts)}")
+    print(f"\n  {'Model':<{col_w}}  {'Bal. Acc':>10}  {'Kappa':>8}")
+    print(f"  {'-'*col_w}  {'-'*10}  {'-'*8}")
+    print(f"  {'random_aggregator':<{col_w}}  {bacc_str:>10}  {kappa_str:>8}")
+    print(f"\n  Aggregator selection counts: {dict(aggregator_choice_counts)}")
+
+    # --- Error summary ---
+    errors   = [r for r in completed_records if r.get("aggregator_error")]
+    missing  = [r for r in completed_records if r.get("aggregator_label") is None and not r.get("aggregator_error")]
+
+    if errors:
+        print(f"\n[ERRORS] {len(errors)} record(s) with errors:")
+        for r in errors:
+            print(f"  sample_id={r.get('sample_id')}  model={r.get('aggregator_model')}  err={r.get('aggregator_error')}")
+        err_ids = " ".join(str(r["sample_id"]) for r in errors)
+        model_short = args.exclude.split("/")[-1] if args.exclude else "none"
+        print(f"  Retry: python random_aggregator.py --lang {args.lang} --seed {args.seed} --exclude {model_short} --sample_ids {err_ids}")
+
+    if missing:
+        print(f"\n[MISSING] {len(missing)} record(s) with no label:")
+        for r in missing:
+            print(f"  sample_id={r.get('sample_id')}  reason={r.get('aggregator_error', 'unknown')}")
+
+    if not errors and not missing:
+        print("\n[OK] All records have labels.")
 
     save_json(output_path, {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -422,7 +491,7 @@ def main() -> None:
         "aggregator_choice_counts": dict(aggregator_choice_counts),
         "records": completed_records,
     })
-    print(f"Saved to: {output_path}")
+    print(f"\nSaved to: {output_path}")
 
 
 if __name__ == "__main__":

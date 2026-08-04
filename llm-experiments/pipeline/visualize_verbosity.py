@@ -142,22 +142,31 @@ def plot_verbosity_vs_bacc(
 
 def run_lang(lang: str, unit: str, ignore_models: set[str]) -> None:
     lang_dir  = RESULTS_ROOT / lang
-    plots_dir = lang_dir / "plots"
-    algo_path = lang_dir / f"algo_agg_{lang}.json"
+    plots_dir     = lang_dir / "plots"
+    algo_path     = lang_dir / f"algo_agg_{lang}.json"
+    judgment_path = lang_dir / f"memerag_judgement_{lang}.json"
 
-    if not algo_path.exists():
-        print(f"[{lang}] algo_agg_{lang}.json not found — run pipeline first")
+    # Try algo_agg first (has both labels and raw text), fall back to judgement JSON
+    source_path = None
+    if algo_path.exists():
+        source_path = algo_path
+    elif judgment_path.exists():
+        source_path = judgment_path
+        print(f"  [fallback] algo_agg_{lang}.json not found, using memerag_judgement_{lang}.json")
+
+    if source_path is None:
+        print(f"[{lang}] no data file found — need algo_agg_{lang}.json or memerag_judgement_{lang}.json")
         return
 
     print(f"\n[{lang.upper()}] → {plots_dir}")
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    data    = load_json(algo_path)
+    data    = load_json(source_path)
     models  = [m for m in data.get("models", []) if m not in ignore_models]
     records = data.get("records", [])
 
     if not models or not records:
-        print(f"  [SKIP] No models or records found in algo_agg_{lang}.json")
+        print(f"  [SKIP] No models or records found in {source_path.name}")
         return
 
     plot_verbosity_vs_bacc(lang, records, models, unit, plots_dir)

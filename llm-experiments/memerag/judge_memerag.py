@@ -1,10 +1,10 @@
 '''
 Command args to run:
-python judge_memerag.py --lang en --dataset_name memerag_ext --all
-python judge_memerag.py --lang es --dataset_name memerag_ext --all
-python judge_memerag.py --lang de --dataset_name memerag_ext --all
-python judge_memerag.py --lang fr --dataset_name memerag_ext --all
-python judge_memerag.py --lang hi --dataset_name memerag_ext --all
+python judge_memerag.py --lang en --all
+python judge_memerag.py --lang es --all
+python judge_memerag.py --lang de --all
+python judge_memerag.py --lang fr --all
+python judge_memerag.py --lang hi --all
 '''
 
 from __future__ import annotations
@@ -36,14 +36,39 @@ PROJECT_ID = "llm-juries-503009"
 DEFAULT_LOCATION = "global"
 GOOGLE_GENAI_USE_VERTEXAI = "True"
 
+BLABLADOR_BASE_URL = "https://api.blablador.fz-juelich.de/v1/"
+BLABLADOR_MAX_TOKENS = 6000  # high enough for thinking models (MiniMax, Qwen3.x)
+
+# Maps clean display name (used everywhere: JSON, CSV, keys) → full Blablador API ID
+BLABLADOR_API_IDS: dict[str, str] = {
+    "MiniMax-M2.7":  "01 - MiniMax-M2.7 - our best model as of April, 2026",
+    "GPT-OSS-120b":  "01 - GPT-OSS-120b - an open model released by OpenAI in August 2025",
+    "Qwen3.5-122B":  "02 - Qwen3.5-122B-A10B-FP8, general purpose large model",
+    "Qwen3.6-35B":   "08 - Qwen3.6-35B-A3B-FP8 - Multimodal model from Apr 2026",
+    "Apertus-8B":    "15 - Apertus-8B-Instruct-2509 - A new swiss model from September 2025",
+}
+
 MODELS = [
-    # "meta/llama-3.3-70b-instruct-maas",
-    # "google/gemma-4-26b-a4b-it-maas",
+    "meta/llama-3.3-70b-instruct-maas",
+    "google/gemma-4-26b-a4b-it-maas",
     "gemini-2.5-flash",
     # "gemini-2.5-flash-lite",
-    # "gpt-5.4-mini",
+    "gpt-5.4-mini",
     # "gpt-5.4-mini-2026-03-17",
+    "MiniMax-M2.7",
+    "GPT-OSS-120b",
+    "Qwen3.6-35B",
+    "Apertus-8B",
+    # "Qwen3.5-122B",  # Not used because of connection issues
+
 ]
+
+# Models excluded from accuracy tables, best-model selection, and missing/error analysis.
+# Add or remove model names here to control what appears in the output.
+IGNORE_MODELS: set[str] = {
+    "gpt-5.4-mini",
+    "gpt-5.4-mini-2026-03-17",
+}
 
 SEED = 42
 MAX_RETRIES = 3
@@ -127,6 +152,10 @@ def is_openai_model(model_name: str) -> bool:
     return model_name.startswith("gpt-")
 
 
+def is_blablador_model(model_name: str) -> bool:
+    return model_name in BLABLADOR_API_IDS
+
+
 def load_memerag_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -154,7 +183,7 @@ def load_memerag_jsonl(path: Path) -> list[dict[str, Any]]:
                     if text:
                         context_texts.append(text)
 
-            for answer in answers:
+            for s_idx, answer in enumerate(answers):
                 if not isinstance(answer, dict):
                     continue
                 sentence = str(answer.get("sentence", "")).strip()
@@ -172,11 +201,12 @@ def load_memerag_jsonl(path: Path) -> list[dict[str, Any]]:
                         [normalize_label(item) for item in factuality_all]
                     )
 
+                sentence_id = answer.get("sentence_id", s_idx)
                 rows.append(
                     {
-                        "sample_id": query_id,
+                        "sample_id": f"{query_id}#s{sentence_id}",
                         "query_id": query_id,
-                        "sentence_id": answer.get("sentence_id"),
+                        "sentence_id": sentence_id,
                         "query": query,
                         "context_texts": context_texts,
                         "answer_segment": sentence,
@@ -289,6 +319,44 @@ def call_openai_with_retry(
                     time.sleep(delay)
                     continue
                 return None, "Empty response after all retries"
+            return text, None
+        except Exception as exc:
+            error_msg = str(exc)
+            is_rate_limited = "429" in error_msg or "rate_limit" in error_msg.lower()
+            if attempt < max_retries - 1 and is_rate_limited:
+                delay = base_delay * (2 ** attempt)
+                print(f"  [RETRY] Rate-limited. Waiting {delay:.1f}s before retry {attempt + 2}/{max_retries}...")
+                time.sleep(delay)
+                continue
+            return None, error_msg
+    return None, "Max retries exceeded"
+
+
+def call_blablador_with_retry(
+    client: Any,
+    model: str,
+    prompt: str,
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = RETRY_BASE_DELAY,
+) -> tuple[str | None, str | None]:
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=BLABLADOR_MAX_TOKENS,
+                temperature=0,
+            )
+            text = response.choices[0].message.content
+            if text is None:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"  [RETRY] Empty response. Waiting {delay:.1f}s before retry {attempt + 2}/{max_retries}...")
+                    time.sleep(delay)
+                    continue
+                return None, "Empty response after all retries"
+            # Strip <think>...</think> blocks produced by reasoning models (MiniMax, Qwen3.x)
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
             return text, None
         except Exception as exc:
             error_msg = str(exc)
@@ -481,12 +549,7 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run AG+COT MEMERAG judges on MEMERAG JSONL data.")
     parser.add_argument("--lang", required=True, choices=["en", "es", "de", "fr", "hi"], help="Target language for evaluation.")
-    parser.add_argument(
-        "--dataset_name",
-        required=True,
-        choices=["memerag", "memerag_ext", "memerag_ext_w_majority_vote"],
-        help="The dataset to use.",
-    )
+
     parser.add_argument(
         "--samples",
         type=int,
@@ -522,7 +585,7 @@ def main() -> None:
 
     random.seed(SEED)
 
-    data_file = DATA_ROOT / args.dataset_name / f"{args.lang}.jsonl"
+    data_file = DATA_ROOT / "memerag_ext" / f"{args.lang}.jsonl"
     if not data_file.exists():
         raise FileNotFoundError(f"Dataset file not found: {data_file}")
 
@@ -547,7 +610,7 @@ def main() -> None:
     else:
         candidate_data = all_data
 
-    output_dir = ROOT / "results_tmp" / args.dataset_name / args.lang
+    output_dir = ROOT / "results_tmp" / "memerag_ext" / args.lang
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"memerag_judgement_{args.lang}.json"
 
@@ -562,10 +625,6 @@ def main() -> None:
         except Exception:
             resume_records = []
 
-    # Patch mode: drop requested IDs from resume so they get re-run
-    if requested_ids:
-        resume_records = [r for r in resume_records if str(r.get("sample_id")) not in requested_ids]
-
     # Model-level resume: mutable lookup dict keyed by sample_id
     completed_records_dict: dict[str, dict[str, Any]] = {
         str(r.get("sample_id")): r for r in resume_records
@@ -576,7 +635,16 @@ def main() -> None:
     for row in candidate_data:
         sid = str(row["sample_id"])
         existing_outputs = completed_records_dict.get(sid, {}).get("model_outputs", {})
-        missing = [m for m in MODELS if m not in existing_outputs]
+        if requested_ids and sid in requested_ids:
+            # Retry mode: re-run models that are missing OR previously failed/returned null
+            missing = [
+                m for m in MODELS
+                if m not in existing_outputs
+                or existing_outputs[m].get("label") is None
+                or existing_outputs[m].get("error")
+            ]
+        else:
+            missing = [m for m in MODELS if m not in existing_outputs]
         if missing:
             remaining_with_missing.append((row, missing))
 
@@ -593,7 +661,8 @@ def main() -> None:
         from google import genai
         from google.genai.types import HttpOptions
     except Exception as exc:
-        if any(not is_openai_model(m) for m in MODELS):
+        needs_google = any(not is_openai_model(m) and not is_blablador_model(m) for m in MODELS)
+        if needs_google:
             print(f"[ERROR] Could not import google-genai: {exc}")
             return
 
@@ -610,6 +679,14 @@ def main() -> None:
             raise ValueError("OPENAI_API_KEY environment variable not set (required for GPT models)")
         openai_client = OpenAI(api_key=api_key)
 
+    blablador_client = None
+    if any(is_blablador_model(m) for m in MODELS):
+        from openai import OpenAI
+        blablador_key = os.environ.get("BLABLADOR_API_KEY")
+        if not blablador_key:
+            raise ValueError("BLABLADOR_API_KEY environment variable not set (required for Blablador models)")
+        blablador_client = OpenAI(base_url=BLABLADOR_BASE_URL, api_key=blablador_key)
+
     def build_summary() -> dict[str, Any]:
         completed_records = list(completed_records_dict.values())
         # BUG FIX: MODELS only contains the models for the current run (e.g. just GPT models when
@@ -624,7 +701,7 @@ def main() -> None:
                     seen_set.add(m)
         summary: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "dataset_name": args.dataset_name,
+            "dataset_name": "memerag_ext",
             "lang": args.lang,
             "data_file": str(data_file),
             "n_samples": len(completed_records),
@@ -644,10 +721,12 @@ def main() -> None:
         summary["metrics"]["panel_majority"] = {
             "balanced_accuracy": compute_bacc(completed_records, "__panel_majority"),
         }
-        # Find best individual model by balanced accuracy (excluding panel_majority)
+        # Find best individual model by balanced accuracy (excluding panel_majority and ignored models)
         best_model = None
         best_bacc = -1.0
         for m in all_models_seen:
+            if m in IGNORE_MODELS:
+                continue
             bacc = summary["metrics"][m].get("balanced_accuracy")
             if bacc is not None and bacc > best_bacc:
                 best_bacc = bacc
@@ -657,7 +736,10 @@ def main() -> None:
         return summary
 
     def checkpoint() -> None:
-        save_json(output_path, build_summary())
+        summary = build_summary()
+        for k in ("metrics", "best_model", "best_model_bacc"):
+            summary.pop(k, None)
+        save_json(output_path, summary)
 
     try:
         for index, (sample, missing_models) in enumerate(remaining_with_missing, start=1):
@@ -678,6 +760,10 @@ def main() -> None:
                 if is_openai_model(model_name):
                     raw_text, error = call_openai_with_retry(openai_client, model_name, prompt)
                     location = "openai"
+                elif is_blablador_model(model_name):
+                    api_id = BLABLADOR_API_IDS[model_name]
+                    raw_text, error = call_blablador_with_retry(blablador_client, api_id, prompt)
+                    location = "blablador"
                 else:
                     location = model_location_for(model_name)
                     client = genai.Client(
@@ -749,26 +835,142 @@ def main() -> None:
         print(f"Saved {len(completed_records_dict)}/{len(candidate_data)} samples to {output_path}")
         return
 
+    # Auto-retry: one extra pass for any model that errored in the main run
+    retry_queue: list[tuple[dict[str, Any], list[str]]] = []
+    seen_retry_sids: set[str] = set()
+    for row in candidate_data:
+        sid = str(row["sample_id"])
+        if sid in seen_retry_sids:
+            continue
+        outputs = completed_records_dict.get(sid, {}).get("model_outputs", {})
+        errored = [
+            m for m in MODELS
+            if isinstance(outputs.get(m), dict)
+            and (outputs[m].get("label") is None or outputs[m].get("error"))
+        ]
+        if errored:
+            retry_queue.append((row, errored))
+            seen_retry_sids.add(sid)
+
+    if retry_queue:
+        n_errors = sum(len(ms) for _, ms in retry_queue)
+        print(f"\n[AUTO-RETRY] {n_errors} errored response(s) across {len(retry_queue)} sample(s) — retrying once...")
+        for retry_idx, (sample, error_models) in enumerate(retry_queue, start=1):
+            prompt      = build_prompt(sample)
+            sid         = str(sample["sample_id"])
+            print(f"\n  [{retry_idx}/{len(retry_queue)}] sample_id={sid} | retrying: {error_models}")
+            existing_record = completed_records_dict[sid]
+            merged_outputs  = dict(existing_record.get("model_outputs", {}))
+
+            for model_name in error_models:
+                if is_openai_model(model_name):
+                    raw_text, error = call_openai_with_retry(openai_client, model_name, prompt)
+                    location = "openai"
+                elif is_blablador_model(model_name):
+                    api_id = BLABLADOR_API_IDS[model_name]
+                    raw_text, error = call_blablador_with_retry(blablador_client, api_id, prompt)
+                    location = "blablador"
+                else:
+                    location = model_location_for(model_name)
+                    retry_client = genai.Client(
+                        http_options=HttpOptions(api_version="v1"),
+                        vertexai=True, project=PROJECT_ID, location=location,
+                    )
+                    raw_text, error = call_model_with_retry(retry_client, model_name, prompt)
+
+                label, reason = extract_label_and_reason(raw_text) if raw_text else (None, None)
+                merged_outputs[model_name] = {
+                    "label": label, "reason": reason, "raw": raw_text, "error": error,
+                    "location": location,
+                    "eval_label": impute_label(sample.get("gold_label"), label),
+                    "correct_gold": label == sample.get("gold_label")
+                        if label in {"Supported", "Not Supported"} else None,
+                }
+                print(f"    {model_name} -> {label} ({'error' if error else 'ok'})")
+
+            votes = [info["label"] for info in merged_outputs.values()]
+            existing_record["model_outputs"] = merged_outputs
+            existing_record["panel_majority"] = majority_vote(votes)
+            existing_record["panel_majority_eval_label"] = impute_label(
+                sample.get("gold_label"), existing_record["panel_majority"]
+            )
+
+        checkpoint()
+        print(f"  [auto-retry done] checkpoint saved")
+
     final = build_summary()
-    save_json(output_path, final)
+    save_data = {k: v for k, v in final.items() if k not in ("metrics", "best_model", "best_model_bacc")}
+    save_json(output_path, save_data)
     completed_records = list(completed_records_dict.values())
 
-    # BUG FIX: use all_models from the summary (not just MODELS) so print covers every judge
+    # All models seen across records; filter out ignored ones for display/analysis
     all_models_in_summary = [m for m in final["metrics"] if m != "panel_majority"]
-    print_response_analysis(completed_records, all_models_in_summary)
+    active_models = [m for m in all_models_in_summary if m not in IGNORE_MODELS]
+    print_response_analysis(completed_records, active_models)
 
-    print("Balanced accuracy / Cohen's Kappa:")
-    for model_name in all_models_in_summary:
+    # Build rows sorted by bacc descending; panel_majority always last
+    metric_rows: list[tuple[str, float | None, float | None]] = []
+    for model_name in active_models:
         bacc = final["metrics"][model_name]["balanced_accuracy"]
         kappa = compute_cohen_kappa(completed_records, f"__{model_name}")
-        print(f"  {model_name}: bacc={'n/a' if bacc is None else f'{bacc:.4f}'}  kappa={'n/a' if kappa is None else f'{kappa:.4f}'}")
+        metric_rows.append((model_name, bacc, kappa))
+    metric_rows.sort(key=lambda x: x[1] if x[1] is not None else -1, reverse=True)
     panel_bacc = final["metrics"]["panel_majority"]["balanced_accuracy"]
     panel_kappa = compute_cohen_kappa(completed_records, "__panel_majority")
-    print(f"  panel_majority: bacc={'n/a' if panel_bacc is None else f'{panel_bacc:.4f}'}  kappa={'n/a' if panel_kappa is None else f'{panel_kappa:.4f}'}")
+    metric_rows.append(("panel_majority", panel_bacc, panel_kappa))
+
+    print("\nBalanced Accuracy / Cohen's Kappa  (Gap = BAcc − Kappa; lower gap = less class-bias):")
+    col = 42
+    print(f"  {'Model':<{col}} {'BAcc':>7}  {'Kappa':>7}  {'Gap':>7}")
+    print("  " + "-" * (col + 28))
+    for model_name, bacc, kappa in metric_rows:
+        bacc_str  = "n/a" if bacc  is None else f"{bacc:.4f}"
+        kappa_str = "n/a" if kappa is None else f"{kappa:.4f}"
+        gap_str   = "n/a" if (bacc is None or kappa is None) else f"{bacc - kappa:.4f}"
+        print(f"  {model_name:<{col}} {bacc_str:>7}  {kappa_str:>7}  {gap_str:>7}")
 
     print(f"\nBest individual model (excl. panel_majority): {final.get('best_model')}  bacc={final.get('best_model_bacc')}")
     print(f"Label distribution: {Counter(r['gold_label'] for r in completed_records)}")
     print(f"Saved results to: {output_path}")
+
+    # Per-model breakdown: missing (absent from model_outputs) vs errors (null label / API error)
+    total_records = len(completed_records)
+    missing_per_model: dict[str, list[str]] = {}
+    error_per_model: dict[str, list[str]] = {}
+    for model_name in active_models:
+        for r in completed_records:
+            sid = str(r.get("sample_id", ""))
+            outputs = r.get("model_outputs", {})
+            if model_name not in outputs:
+                missing_per_model.setdefault(model_name, []).append(sid)
+            else:
+                info = outputs[model_name]
+                if isinstance(info, dict) and (info.get("label") is None or info.get("error")):
+                    error_per_model.setdefault(model_name, []).append(sid)
+
+    if missing_per_model:
+        all_missing_ids: set[str] = set()
+        print(f"\n[MISSING] Models with no response entry (out of {total_records} records):")
+        for model_name, ids in missing_per_model.items():
+            all_missing_ids.update(ids)
+            print(f"  {model_name}: {len(ids)} missing")
+            print(f"    sample_ids: {' '.join(ids)}")
+        print(f"\nRecover missing samples (uncomment affected models in MODELS first):")
+        print(f"  python judge_memerag.py --lang {args.lang} --sample_ids {' '.join(sorted(all_missing_ids))}")
+    else:
+        print(f"\n[OK] No missing responses — all models present in all {total_records} records.")
+
+    if error_per_model:
+        all_error_ids: set[str] = set()
+        print(f"\n[ERRORS] Models with null label or API error:")
+        for model_name, ids in error_per_model.items():
+            all_error_ids.update(ids)
+            print(f"  {model_name}: {len(ids)} error(s)")
+            print(f"    sample_ids: {' '.join(ids)}")
+        print(f"\nRetry errored samples with:")
+        print(f"  python judge_memerag.py --lang {args.lang} --sample_ids {' '.join(sorted(all_error_ids))}")
+    else:
+        print("\n[OK] No errors — all model responses have valid labels.")
 
 
 if __name__ == "__main__":

@@ -44,16 +44,6 @@ import argparse
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Maps model ID to its LOO subfolder name — add new models here for future LOO runs
-EXCL_SUBDIR: dict[str, str] = {
-    "gemini-2.5-flash-lite":            "excl_gemini_lite",
-    "gemini-2.5-flash":                 "excl_gemini_flash",
-    "google/gemma-4-26b-a4b-it-maas":  "excl_gemma",
-    "meta/llama-3.3-70b-instruct-maas": "excl_llama",
-    "gpt-5.4-mini":                     "excl_gpt_mini",
-    "gpt-5.4-mini-2026-03-17":          "excl_gpt_mini_march",
-}
-
 SUPPORTED     = "Supported"
 NOT_SUPPORTED = "Not Supported"
 LABELS        = {SUPPORTED, NOT_SUPPORTED}
@@ -507,7 +497,7 @@ def main() -> None:
     INPUT_JSON  = ROOT / "results_tmp" / "memerag_ext" / args.lang / f"memerag_judgement_{args.lang}.json"
     OUTPUT_JSON = ROOT / "results_tmp" / "memerag_ext" / args.lang / f"aggregator_weighted_{args.lang}.json"
     if args.exclude:
-        excl_folder = EXCL_SUBDIR.get(args.exclude, "excl_" + args.exclude.split("/")[-1].replace(".", "_"))
+        excl_folder = "excl_" + args.exclude.split("/")[-1].lower().replace(".", "_").replace("-", "_")
         OUTPUT_JSON = OUTPUT_JSON.parent / excl_folder / OUTPUT_JSON.name
         print(f"[INFO] Excluding model from panel: {args.exclude}")
 

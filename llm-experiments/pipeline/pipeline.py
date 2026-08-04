@@ -8,6 +8,8 @@ Reads judge outputs produced by judge_memerag.py and runs:
 Usage:
     python pipeline/pipeline.py --lang en
     python pipeline/pipeline.py --lang en --dry-run
+    python pipeline/pipeline.py --lang en --no-llm-agg
+
 """
 from __future__ import annotations
 
@@ -144,19 +146,48 @@ def build_prompt(record: dict[str, Any], panel: list[str]) -> str:
     return AGGREGATOR_PROMPT.format(task_prompt=task, judge_responses=responses)
 
 
-def pick_best_bacc_model(judge_data: dict, proposers: list[str]) -> str:
-    metrics = judge_data.get("summary", {}).get("metrics", {})
-    if not metrics:
-        metrics = judge_data.get("metrics", {})
+def _bacc_from_records(records: list[dict], model: str) -> float | None:
+    """Compute balanced accuracy for a model directly from judge records."""
+    pos_correct = pos_total = neg_correct = neg_total = 0
+    for rec in records:
+        gold = rec.get("gold_label")
+        out  = (rec.get("model_outputs") or {}).get(model)
+        label = out.get("label") if isinstance(out, dict) else None
+        if gold == "Supported":
+            pos_total += 1
+            if label == "Supported":
+                pos_correct += 1
+        elif gold == "Not Supported":
+            neg_total += 1
+            if label == "Not Supported":
+                neg_correct += 1
+    if pos_total == 0 or neg_total == 0:
+        return None
+    return (pos_correct / pos_total + neg_correct / neg_total) / 2
+
+
+def pick_best_bacc_model(records: list[dict], proposers: list[str]) -> str:
     best_model, best_bacc = None, -1.0
     for m in proposers:
-        bacc = (metrics.get(m) or {}).get("balanced_accuracy")
+        bacc = _bacc_from_records(records, m)
         if bacc is not None and bacc > best_bacc:
             best_bacc, best_model = bacc, m
     if best_model is None:
-        print(f"[WARN] No bacc metrics in judge JSON, falling back to {proposers[0]}")
+        print(f"[WARN] Could not compute bacc from records, falling back to {proposers[0]}")
         best_model = proposers[0]
     return best_model
+
+
+def pick_worse_bacc_model(records: list[dict], proposers: list[str]) -> str:
+    worst_model, worst_bacc = None, float("inf")
+    for m in proposers:
+        bacc = _bacc_from_records(records, m)
+        if bacc is not None and bacc < worst_bacc:
+            worst_bacc, worst_model = bacc, m
+    if worst_model is None:
+        print(f"[WARN] Could not compute bacc from records, falling back to {proposers[-1]}")
+        worst_model = proposers[-1]
+    return worst_model
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +358,7 @@ def run_algo_aggregation(
     records: list[dict],
     lang: str,
     proposers: list[str],
+    save: bool = True,
 ) -> tuple[list[tuple[str, float | None, float | None]], dict | None]:
     active_models, matrix = extract_vote_matrix(records, proposers)
     table_rows: list[tuple[str, float | None, float | None]] = []
@@ -399,19 +431,22 @@ def run_algo_aggregation(
             active_models, matrix, ds_alpha, ds_beta, records, seed=config.SEED
         )
 
-    out_path = out_dir(lang) / f"algo_agg_{lang}.json"
-    save_json(out_path, {
-        "timestamp":            datetime.now(timezone.utc).isoformat(),
-        "lang":                 lang,
-        "methods":              config.AGGREGATION_ALGOS,
-        "excluded_model":       config.EXCLUDE_MODEL,
-        "models":               active_models,
-        "method_params":        method_params,
-        "ds_reliability_analysis": ds_reliability_result,
-        "records":              records,
-        "metrics":              metrics,
-    })
-    print(f"  → {out_path.name}")
+    if save:
+        out_path = out_dir(lang) / f"algo_agg_{lang}.json"
+        save_json(out_path, {
+            "timestamp":            datetime.now(timezone.utc).isoformat(),
+            "lang":                 lang,
+            "methods":              config.AGGREGATION_ALGOS,
+            "excluded_model":       config.EXCLUDE_MODEL,
+            "models":               active_models,
+            "method_params":        method_params,
+            "ds_reliability_analysis": ds_reliability_result,
+            "records":              records,
+            "metrics":              metrics,
+        })
+        print(f"  → {out_path.name}")
+    else:
+        print(f"  [no-llm-agg] skipping save of algo_agg_{lang}.json")
 
     return table_rows, ds_reliability_result
 
@@ -424,7 +459,6 @@ def run_llm_aggregation(
     records: list[dict],
     lang: str,
     proposers: list[str],
-    judge_data: dict,
     clients: dict,
     genai: Any,
     HttpOptions: Any,
@@ -434,8 +468,11 @@ def run_llm_aggregation(
     # Determine fixed aggregator model
     fixed_model: str | None = None
     if method == "best_bacc":
-        fixed_model = pick_best_bacc_model(judge_data, proposers)
+        fixed_model = pick_best_bacc_model(records, proposers)
         print(f"  best_bacc selected: {fixed_model}")
+    elif method == "worse_bacc":
+        fixed_model = pick_worse_bacc_model(records, proposers)
+        print(f"  worse_bacc selected: {fixed_model}")
     elif method == "fixed":
         fixed_model = config.AGGREGATOR_MODEL
     elif method == "ds_rank":
@@ -586,6 +623,7 @@ def run_llm_aggregation(
             print(f"    {m}: {cnt}")
 
     print(f"  bacc={fmt(bacc)}  kappa={fmt(kappa)}")
+    print(f"\n  Saved → {out_path.name}")
 
     errors  = [r for r in completed if r.get("aggregator_error") and r.get("aggregator_error") != "insufficient models"]
     missing = [r for r in completed if r.get("aggregator_label") is None and not r.get("aggregator_error")]
@@ -593,22 +631,19 @@ def run_llm_aggregation(
 
     excl_flag = f" --exclude {config.EXCLUDE_MODEL}" if config.EXCLUDE_MODEL else ""
     retry_cmd = f"python pipeline/pipeline.py --lang {lang}{excl_flag}"
+    retry_hint: str | None = None
 
     if errors:
-        err_ids = " ".join(str(r["sample_id"]) for r in errors)
         print(f"\n  [ERRORS] {len(errors)} records with API errors:")
         for r in errors:
             print(f"    sample_id={r['sample_id']}  model={r.get('aggregator_model')}  {r.get('aggregator_error')}")
-        print(f"    sample_ids: {err_ids}")
-        print(f"  Retry (errors are retried automatically on re-run):")
-        print(f"    {retry_cmd}")
+        retry_hint = retry_cmd
 
     if missing:
         miss_ids = " ".join(str(r["sample_id"]) for r in missing)
         print(f"\n  [MISSING] {len(missing)} records with no label and no error:")
         print(f"    sample_ids: {miss_ids}")
-        print(f"  Retry:")
-        print(f"    {retry_cmd}")
+        retry_hint = retry_cmd
 
     if insuff:
         insuff_ids = " ".join(str(r["sample_id"]) for r in insuff)
@@ -618,15 +653,13 @@ def run_llm_aggregation(
     if not errors and not missing:
         print("\n  [OK] All records have labels.")
 
-    print(f"\n  Saved → {out_path.name}")
-
     row_label = "llm_random" if method == "random" else f"llm_{method}({fixed_model.split('/')[-1]})"
 
     # Build sample_id → aggregator_label map for method kappa computation
     sid_to_label: dict[str, str | None] = {
         str(r.get("sample_id")): r.get("__aggregator") for r in completed
     }
-    return row_label, bacc, kappa, sid_to_label
+    return row_label, bacc, kappa, sid_to_label, retry_hint
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +703,14 @@ def save_method_kappa_json(
         except Exception:
             pass
     existing_pairwise = existing.get("method_pairwise_kappa", {})
+    # Drop stale entries for the same method type (e.g. old llm_best_bacc(gemma) when
+    # current run is llm_best_bacc(qwen)) so only the latest run for each method is kept.
+    if llm_label and "(" in llm_label:
+        method_prefix = llm_label.split("(")[0]
+        existing_pairwise = {
+            k: v for k, v in existing_pairwise.items()
+            if not any(part.split("(")[0] == method_prefix for part in k.split(" vs "))
+        }
     merged_pairwise = {**existing_pairwise, **pairwise}
 
     output: dict[str, Any] = {"method_pairwise_kappa": merged_pairwise}
@@ -705,7 +746,7 @@ def save_metrics_csv(
     Section 2: inter-judge pairwise kappa matrix.
     Section 3: DS reliability scores (ds_rank, alpha, beta, true_bacc) — our addition.
     """
-    FIELDS = ["kind", "name", "balanced_accuracy", "cohen_kappa"]
+    FIELDS = ["kind", "name", "balanced_accuracy", "cohen_kappa", "gap"]
     ALGO_KIND    = {"majority": "majority_vote", "owi": "weighted_agg",
                     "isp": "weighted_agg",       "ds": "weighted_agg"}
     ALGO_DISPLAY = {"majority": "majority", "owi": "OW-I", "isp": "ISP", "ds": "Dawid-Skene"}
@@ -713,12 +754,20 @@ def save_metrics_csv(
     def _pct_str(v: float | None) -> str:
         return f"{v * 100:.2f}%" if v is not None else "n/a"
 
+    def _gap(bacc: float | None, kappa: float | None) -> str:
+        if bacc is None or kappa is None:
+            return "n/a"
+        return _pct_str(bacc - kappa)
+
     def _row(kind: str, name: str, stats: dict) -> dict:
+        bacc  = stats["balanced_accuracy"]
+        kappa = stats["cohen_kappa"]
         return {
             "kind":               kind,
             "name":               name,
-            "balanced_accuracy":  _pct_str(stats["balanced_accuracy"]),
-            "cohen_kappa":        _pct_str(stats["cohen_kappa"]),
+            "balanced_accuracy":  _pct_str(bacc),
+            "cohen_kappa":        _pct_str(kappa),
+            "gap":                _gap(bacc, kappa),
         }
 
     # --- Build fresh rows ---
@@ -750,6 +799,7 @@ def save_metrics_csv(
     # --- Load existing aggregator rows from previous LLM runs ---
     csv_path = out_dir(lang) / f"metrics_summary_{lang}.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
+    method_prefix = llm_label.split("(")[0] if (llm_label and "(" in llm_label) else None
     existing_agg: dict[tuple[str, str], dict] = {}
     if csv_path.exists():
         try:
@@ -759,11 +809,22 @@ def save_metrics_csv(
                     for row in reader:
                         if row.get("kind") == "aggregator":
                             key = ("aggregator", row["name"])
+                            # Skip stale entries for the same method type as current run
+                            if method_prefix and row["name"].startswith(method_prefix + "("):
+                                continue
                             if key not in fresh_rows:
+                                bacc_str  = row.get("balanced_accuracy", "n/a")
+                                kappa_str = row.get("cohen_kappa", "n/a")
+                                try:
+                                    gap_val = float(bacc_str.rstrip("%")) - float(kappa_str.rstrip("%"))
+                                    gap_str = f"{gap_val:.2f}%"
+                                except (ValueError, AttributeError):
+                                    gap_str = row.get("gap", "n/a")
                                 existing_agg[key] = {
                                     "kind": row["kind"], "name": row["name"],
-                                    "balanced_accuracy": row.get("balanced_accuracy", "n/a"),
-                                    "cohen_kappa":       row.get("cohen_kappa", "n/a"),
+                                    "balanced_accuracy": bacc_str,
+                                    "cohen_kappa":       kappa_str,
+                                    "gap":               gap_str,
                                 }
         except Exception:
             pass
@@ -843,11 +904,19 @@ def save_metrics_csv(
 def main() -> None:
     parser = argparse.ArgumentParser(description="MEMERAG aggregation pipeline.")
     parser.add_argument("--lang", required=True, choices=["en", "es", "de", "fr", "hi"])
+    parser.add_argument("--samples", type=int, default=None,
+                        help="Limit to first N records (useful for quick checks).")
+    parser.add_argument("--no-llm-agg", action="store_true",
+                        help="Skip LLM aggregation step (overrides config.AGGREGATOR_LLM).")
     parser.add_argument("--dry-run", action="store_true", help="Print what would run, no execution.")
     args = parser.parse_args()
 
     lang      = args.lang
     proposers = active_proposers()
+
+    # CLI overrides
+    if args.no_llm_agg:
+        config.AGGREGATOR_LLM = None
 
     print(f"Lang      : {lang}")
     print(f"Proposers : {proposers}")
@@ -868,6 +937,9 @@ def main() -> None:
     if not records:
         print(f"[ERROR] No records in {input_path}")
         sys.exit(1)
+
+    if args.samples is not None:
+        records = records[: args.samples]
 
     print(f"Records   : {len(records)} loaded from {input_path.name}")
 
@@ -892,7 +964,7 @@ def main() -> None:
     # ── Step 1: Algorithmic aggregation ──────────────────────────────────
     if config.AGGREGATION_ALGOS:
         print(f"\n{'='*60}\nALGORITHMIC AGGREGATION\n{'='*60}")
-        algo_rows, ds_reliability_result = run_algo_aggregation(records, lang, proposers)
+        algo_rows, ds_reliability_result = run_algo_aggregation(records, lang, proposers, save=not args.no_llm_agg)
         all_results.extend(algo_rows)
         algo_keys = list(config.AGGREGATION_ALGOS)
 
@@ -910,10 +982,11 @@ def main() -> None:
 
         clients = init_clients(proposers)
         result  = run_llm_aggregation(
-            records, lang, proposers, judge_data, clients, genai, HttpOptions,
+            records, lang, proposers, clients, genai, HttpOptions,
         )
+        retry_hint: str | None = None
         if result:
-            row_label, bacc, kappa, sid_to_label = result
+            row_label, bacc, kappa, sid_to_label, retry_hint = result
             all_results.append((row_label, bacc, kappa))
             llm_preds     = sid_to_label
             llm_row_label = row_label
@@ -923,57 +996,27 @@ def main() -> None:
         print(f"\n{'='*60}\nRESULTS SUMMARY\n{'='*60}")
         print_metrics_table(all_results)
 
-    # ── Combined algo+LLM file (named by LLM method) ─────────────────────
-    if config.AGGREGATOR_LLM and llm_preds and algo_keys:
-        # Stamp __aggregator onto the original records so combined file has all labels
-        for r in records:
-            r["__aggregator"] = llm_preds.get(str(r.get("sample_id")))
-
-        method = config.AGGREGATOR_LLM
-        suffix = f"random_seed{config.SEED}" if method == "random" else method
-        combined_path = out_dir(lang) / f"algo_agg_{suffix}_{lang}.json"
-
-        combined_metrics = {
-            name: {"balanced_accuracy": pct(bacc), "cohen_kappa": pct(kappa)}
-            for name, bacc, kappa in all_results
-        }
-        # Read method_params from base algo_agg (already saved by run_algo_aggregation)
-        base_algo = out_dir(lang) / f"algo_agg_{lang}.json"
-        method_params = {}
-        if base_algo.exists():
-            try:
-                method_params = load_json(base_algo).get("method_params", {})
-            except Exception:
-                pass
-
-        save_json(combined_path, {
-            "timestamp":               datetime.now(timezone.utc).isoformat(),
-            "lang":                    lang,
-            "methods":                 config.AGGREGATION_ALGOS,
-            "aggregator_llm_method":   method,
-            "excluded_model":          config.EXCLUDE_MODEL,
-            "models":                  proposers,
-            "method_params":           method_params,
-            "ds_reliability_analysis": ds_reliability_result,
-            "records":                 records,
-            "metrics":                 combined_metrics,
-        })
-        print(f"\n  Combined → {combined_path.name}")
-
     # ── Method pairwise kappa + CSV ───────────────────────────────────────
     print(f"\n{'='*60}\nOUTPUT FILES\n{'='*60}")
-    if algo_keys or llm_preds:
-        save_method_kappa_json(
+    if args.no_llm_agg:
+        print("  [no-llm-agg] skipping save of method_kappa and metrics_summary CSV")
+    else:
+        if algo_keys or llm_preds:
+            save_method_kappa_json(
+                records, proposers, algo_keys, lang,
+                llm_preds, llm_row_label, ds_reliability_result,
+            )
+        save_metrics_csv(
             records, proposers, algo_keys, lang,
-            llm_preds, llm_row_label, ds_reliability_result,
+            llm_label=llm_row_label if llm_preds else None,
+            llm_sid_to_label=llm_preds,
+            ds_reliability_result=ds_reliability_result,
         )
-    save_metrics_csv(
-        records, proposers, algo_keys, lang,
-        llm_label=llm_row_label if llm_preds else None,
-        llm_sid_to_label=llm_preds,
-        ds_reliability_result=ds_reliability_result,
-    )
 
+    if retry_hint:
+        print(f"\n{'='*60}")
+        print(f"  [ACTION NEEDED] Some records failed — re-run to retry:")
+        print(f"    {retry_hint}")
 
 if __name__ == "__main__":
     main()

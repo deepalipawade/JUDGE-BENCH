@@ -15,18 +15,6 @@ python aggregator_gemma.py --lang en --all --exclude gemini-2.5-flash-lite --no-
 '''
 
 ROOT = Path(__file__).resolve().parents[2]
-INPUT_JSON_PATH = ROOT / "results_tmp" / "memerag_ext" / "en" / "memerag_judgement_en.json"
-SAVE_JSON_PATH  = ROOT / "results_tmp" / "memerag_ext" / "en" / "aggregator_gemma_en.json"
-
-# Maps model ID to its LOO subfolder name — add new models here for future LOO runs
-EXCL_SUBDIR: dict[str, str] = {
-    "gemini-2.5-flash-lite":            "excl_gemini_lite",
-    "gemini-2.5-flash":                 "excl_gemini_flash",
-    "google/gemma-4-26b-a4b-it-maas":  "excl_gemma",
-    "meta/llama-3.3-70b-instruct-maas": "excl_llama",
-    "gpt-5.4-mini":                     "excl_gpt_mini",
-    "gpt-5.4-mini-2026-03-17":          "excl_gpt_mini_march",
-}
 
 SERVICE_ACCOUNT_PATH = r"C:\Users\Deepali\Downloads\llm-juries-dd7439c15063.json"
 PROJECT_ID = "llm-juries"
@@ -34,6 +22,9 @@ DEFAULT_LOCATION = "global"
 GOOGLE_GENAI_USE_VERTEXAI = "True"
 
 AGGREGATOR_MODEL = "google/gemma-4-26b-a4b-it-maas"
+
+INPUT_JSON_PATH = ROOT / "results_tmp" / "memerag_ext" / "en" / "memerag_judgement_en.json"
+SAVE_JSON_PATH  = ROOT / "results_tmp" / "memerag_ext" / "en" / f"fixed_agg_{AGGREGATOR_MODEL.split('/')[-1]}_en.json"
 DEFAULT_CHECKPOINT_EVERY = 5
 
 PROMPT_TEMPLATE = (
@@ -355,7 +346,7 @@ def main() -> None:
         if args.input is None:
             args.input = lang_dir / f"memerag_judgement_{args.lang}.json"
         if args.output is None:
-            args.output = lang_dir / f"aggregator_gemma_{args.lang}.json"
+            args.output = lang_dir / f"fixed_agg_{AGGREGATOR_MODEL.split('/')[-1]}_{args.lang}.json"
     else:
         if args.input is None:
             args.input = INPUT_JSON_PATH
@@ -378,7 +369,7 @@ def main() -> None:
     # Compute final output path first so resume check reads the correct file
     output_path = args.output
     if args.exclude:
-        excl_folder = EXCL_SUBDIR.get(args.exclude, "excl_" + args.exclude.split("/")[-1].replace(".", "_"))
+        excl_folder = "excl_" + args.exclude.split("/")[-1].lower().replace(".", "_").replace("-", "_")
         output_path = args.output.parent / excl_folder / args.output.name
 
     resume_records: list[dict[str, Any]] = []
