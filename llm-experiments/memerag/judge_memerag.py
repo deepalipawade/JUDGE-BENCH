@@ -49,11 +49,11 @@ BLABLADOR_API_IDS: dict[str, str] = {
 }
 
 MODELS = [
-    # "meta/llama-3.3-70b-instruct-maas",
-    # "google/gemma-4-26b-a4b-it-maas",
-    # "gemini-2.5-flash",
+    "meta/llama-3.3-70b-instruct-maas",
+    "google/gemma-4-26b-a4b-it-maas",
+    "gemini-2.5-flash",
     # "gemini-2.5-flash-lite",
-    # "gpt-5.4-mini",
+    "gpt-5.4-mini",
     # "gpt-5.4-mini-2026-03-17",
     "MiniMax-M2.7",
     "GPT-OSS-120b",
@@ -183,7 +183,7 @@ def load_memerag_jsonl(path: Path) -> list[dict[str, Any]]:
                     if text:
                         context_texts.append(text)
 
-            for answer in answers:
+            for s_idx, answer in enumerate(answers):
                 if not isinstance(answer, dict):
                     continue
                 sentence = str(answer.get("sentence", "")).strip()
@@ -201,11 +201,12 @@ def load_memerag_jsonl(path: Path) -> list[dict[str, Any]]:
                         [normalize_label(item) for item in factuality_all]
                     )
 
+                sentence_id = answer.get("sentence_id", s_idx)
                 rows.append(
                     {
-                        "sample_id": query_id,
+                        "sample_id": f"{query_id}#s{sentence_id}",
                         "query_id": query_id,
-                        "sentence_id": answer.get("sentence_id"),
+                        "sentence_id": sentence_id,
                         "query": query,
                         "context_texts": context_texts,
                         "answer_segment": sentence,
@@ -735,7 +736,10 @@ def main() -> None:
         return summary
 
     def checkpoint() -> None:
-        save_json(output_path, build_summary())
+        summary = build_summary()
+        for k in ("metrics", "best_model", "best_model_bacc"):
+            summary.pop(k, None)
+        save_json(output_path, summary)
 
     try:
         for index, (sample, missing_models) in enumerate(remaining_with_missing, start=1):
@@ -831,8 +835,72 @@ def main() -> None:
         print(f"Saved {len(completed_records_dict)}/{len(candidate_data)} samples to {output_path}")
         return
 
+    # Auto-retry: one extra pass for any model that errored in the main run
+    retry_queue: list[tuple[dict[str, Any], list[str]]] = []
+    seen_retry_sids: set[str] = set()
+    for row in candidate_data:
+        sid = str(row["sample_id"])
+        if sid in seen_retry_sids:
+            continue
+        outputs = completed_records_dict.get(sid, {}).get("model_outputs", {})
+        errored = [
+            m for m in MODELS
+            if isinstance(outputs.get(m), dict)
+            and (outputs[m].get("label") is None or outputs[m].get("error"))
+        ]
+        if errored:
+            retry_queue.append((row, errored))
+            seen_retry_sids.add(sid)
+
+    if retry_queue:
+        n_errors = sum(len(ms) for _, ms in retry_queue)
+        print(f"\n[AUTO-RETRY] {n_errors} errored response(s) across {len(retry_queue)} sample(s) — retrying once...")
+        for retry_idx, (sample, error_models) in enumerate(retry_queue, start=1):
+            prompt      = build_prompt(sample)
+            sid         = str(sample["sample_id"])
+            print(f"\n  [{retry_idx}/{len(retry_queue)}] sample_id={sid} | retrying: {error_models}")
+            existing_record = completed_records_dict[sid]
+            merged_outputs  = dict(existing_record.get("model_outputs", {}))
+
+            for model_name in error_models:
+                if is_openai_model(model_name):
+                    raw_text, error = call_openai_with_retry(openai_client, model_name, prompt)
+                    location = "openai"
+                elif is_blablador_model(model_name):
+                    api_id = BLABLADOR_API_IDS[model_name]
+                    raw_text, error = call_blablador_with_retry(blablador_client, api_id, prompt)
+                    location = "blablador"
+                else:
+                    location = model_location_for(model_name)
+                    retry_client = genai.Client(
+                        http_options=HttpOptions(api_version="v1"),
+                        vertexai=True, project=PROJECT_ID, location=location,
+                    )
+                    raw_text, error = call_model_with_retry(retry_client, model_name, prompt)
+
+                label, reason = extract_label_and_reason(raw_text) if raw_text else (None, None)
+                merged_outputs[model_name] = {
+                    "label": label, "reason": reason, "raw": raw_text, "error": error,
+                    "location": location,
+                    "eval_label": impute_label(sample.get("gold_label"), label),
+                    "correct_gold": label == sample.get("gold_label")
+                        if label in {"Supported", "Not Supported"} else None,
+                }
+                print(f"    {model_name} -> {label} ({'error' if error else 'ok'})")
+
+            votes = [info["label"] for info in merged_outputs.values()]
+            existing_record["model_outputs"] = merged_outputs
+            existing_record["panel_majority"] = majority_vote(votes)
+            existing_record["panel_majority_eval_label"] = impute_label(
+                sample.get("gold_label"), existing_record["panel_majority"]
+            )
+
+        checkpoint()
+        print(f"  [auto-retry done] checkpoint saved")
+
     final = build_summary()
-    save_json(output_path, final)
+    save_data = {k: v for k, v in final.items() if k not in ("metrics", "best_model", "best_model_bacc")}
+    save_json(output_path, save_data)
     completed_records = list(completed_records_dict.values())
 
     # All models seen across records; filter out ignored ones for display/analysis
@@ -851,14 +919,15 @@ def main() -> None:
     panel_kappa = compute_cohen_kappa(completed_records, "__panel_majority")
     metric_rows.append(("panel_majority", panel_bacc, panel_kappa))
 
-    print("\nBalanced Accuracy / Cohen's Kappa:")
+    print("\nBalanced Accuracy / Cohen's Kappa  (Gap = BAcc − Kappa; lower gap = less class-bias):")
     col = 42
-    print(f"  {'Model':<{col}} {'BAcc':>7}  {'Kappa':>7}")
-    print("  " + "-" * (col + 18))
+    print(f"  {'Model':<{col}} {'BAcc':>7}  {'Kappa':>7}  {'Gap':>7}")
+    print("  " + "-" * (col + 28))
     for model_name, bacc, kappa in metric_rows:
-        bacc_str = "n/a" if bacc is None else f"{bacc:.4f}"
+        bacc_str  = "n/a" if bacc  is None else f"{bacc:.4f}"
         kappa_str = "n/a" if kappa is None else f"{kappa:.4f}"
-        print(f"  {model_name:<{col}} {bacc_str:>7}  {kappa_str:>7}")
+        gap_str   = "n/a" if (bacc is None or kappa is None) else f"{bacc - kappa:.4f}"
+        print(f"  {model_name:<{col}} {bacc_str:>7}  {kappa_str:>7}  {gap_str:>7}")
 
     print(f"\nBest individual model (excl. panel_majority): {final.get('best_model')}  bacc={final.get('best_model_bacc')}")
     print(f"Label distribution: {Counter(r['gold_label'] for r in completed_records)}")

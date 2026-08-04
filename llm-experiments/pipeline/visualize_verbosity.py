@@ -151,7 +151,7 @@ def run_lang(lang: str, unit: str, ignore_models: set[str]) -> None:
     if algo_path.exists():
         source_path = algo_path
     elif judgment_path.exists():
-        source_path = jzudgment_path
+        source_path = judgment_path
         print(f"  [fallback] algo_agg_{lang}.json not found, using memerag_judgement_{lang}.json")
 
     if source_path is None:
