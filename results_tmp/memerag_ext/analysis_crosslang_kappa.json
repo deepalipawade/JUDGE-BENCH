@@ -1,0 +1,371 @@
+{
+  "note": "Judge-vs-judge pairs only (algo methods excluded). mean_kappa averaged over all available languages. per_judge summary averages kappa across all pairings and all languages.",
+  "per_judge_summary": {
+    "Qwen3.6-35B": {
+      "mean_kappa_all_pairs": 0.6208,
+      "n_observations": 30
+    },
+    "google/gemma-4-26b-a4b-it-maas": {
+      "mean_kappa_all_pairs": 0.6174,
+      "n_observations": 30
+    },
+    "MiniMax-M2.7": {
+      "mean_kappa_all_pairs": 0.6094,
+      "n_observations": 30
+    },
+    "GPT-OSS-120b": {
+      "mean_kappa_all_pairs": 0.6032,
+      "n_observations": 30
+    },
+    "gemini-2.5-flash": {
+      "mean_kappa_all_pairs": 0.5826,
+      "n_observations": 30
+    },
+    "meta/llama-3.3-70b-instruct-maas": {
+      "mean_kappa_all_pairs": 0.5431,
+      "n_observations": 30
+    },
+    "Apertus-8B": {
+      "mean_kappa_all_pairs": 0.2902,
+      "n_observations": 30
+    }
+  },
+  "judge_pairs": [
+    {
+      "judge_a": "Qwen3.6-35B",
+      "judge_b": "google/gemma-4-26b-a4b-it-maas",
+      "per_lang": {
+        "en": 0.8205,
+        "de": 0.8166,
+        "es": 0.6705,
+        "fr": 0.7345,
+        "hi": 0.7644
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.7613,
+      "min_kappa": 0.6705,
+      "max_kappa": 0.8205,
+      "range": 0.15
+    },
+    {
+      "judge_a": "MiniMax-M2.7",
+      "judge_b": "Qwen3.6-35B",
+      "per_lang": {
+        "en": 0.7927,
+        "de": 0.7207,
+        "es": 0.6592,
+        "fr": 0.7236,
+        "hi": 0.7291
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.7251,
+      "min_kappa": 0.6592,
+      "max_kappa": 0.7927,
+      "range": 0.1335
+    },
+    {
+      "judge_a": "GPT-OSS-120b",
+      "judge_b": "MiniMax-M2.7",
+      "per_lang": {
+        "en": 0.8087,
+        "de": 0.7427,
+        "es": 0.681,
+        "fr": 0.6189,
+        "hi": 0.7204
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.7143,
+      "min_kappa": 0.6189,
+      "max_kappa": 0.8087,
+      "range": 0.1898
+    },
+    {
+      "judge_a": "Qwen3.6-35B",
+      "judge_b": "gemini-2.5-flash",
+      "per_lang": {
+        "en": 0.7462,
+        "de": 0.6632,
+        "es": 0.6784,
+        "fr": 0.7199,
+        "hi": 0.6946
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.7005,
+      "min_kappa": 0.6632,
+      "max_kappa": 0.7462,
+      "range": 0.083
+    },
+    {
+      "judge_a": "GPT-OSS-120b",
+      "judge_b": "google/gemma-4-26b-a4b-it-maas",
+      "per_lang": {
+        "en": 0.7205,
+        "de": 0.7211,
+        "es": 0.6198,
+        "fr": 0.6189,
+        "hi": 0.7767
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6914,
+      "min_kappa": 0.6189,
+      "max_kappa": 0.7767,
+      "range": 0.1578
+    },
+    {
+      "judge_a": "MiniMax-M2.7",
+      "judge_b": "google/gemma-4-26b-a4b-it-maas",
+      "per_lang": {
+        "en": 0.717,
+        "de": 0.6982,
+        "es": 0.6657,
+        "fr": 0.6634,
+        "hi": 0.6899
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6868,
+      "min_kappa": 0.6634,
+      "max_kappa": 0.717,
+      "range": 0.0536
+    },
+    {
+      "judge_a": "GPT-OSS-120b",
+      "judge_b": "Qwen3.6-35B",
+      "per_lang": {
+        "en": 0.7372,
+        "de": 0.7425,
+        "es": 0.6151,
+        "fr": 0.5712,
+        "hi": 0.6804
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6693,
+      "min_kappa": 0.5712,
+      "max_kappa": 0.7425,
+      "range": 0.1713
+    },
+    {
+      "judge_a": "gemini-2.5-flash",
+      "judge_b": "google/gemma-4-26b-a4b-it-maas",
+      "per_lang": {
+        "en": 0.6498,
+        "de": 0.6651,
+        "es": 0.6475,
+        "fr": 0.6615,
+        "hi": 0.7121
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6672,
+      "min_kappa": 0.6475,
+      "max_kappa": 0.7121,
+      "range": 0.0646
+    },
+    {
+      "judge_a": "MiniMax-M2.7",
+      "judge_b": "gemini-2.5-flash",
+      "per_lang": {
+        "en": 0.7228,
+        "de": 0.72,
+        "es": 0.586,
+        "fr": 0.683,
+        "hi": 0.6021
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6628,
+      "min_kappa": 0.586,
+      "max_kappa": 0.7228,
+      "range": 0.1368
+    },
+    {
+      "judge_a": "GPT-OSS-120b",
+      "judge_b": "gemini-2.5-flash",
+      "per_lang": {
+        "en": 0.7073,
+        "de": 0.6262,
+        "es": 0.6277,
+        "fr": 0.6628,
+        "hi": 0.6305
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6509,
+      "min_kappa": 0.6262,
+      "max_kappa": 0.7073,
+      "range": 0.0811
+    },
+    {
+      "judge_a": "google/gemma-4-26b-a4b-it-maas",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.6111,
+        "de": 0.6076,
+        "es": 0.6052,
+        "fr": 0.5672,
+        "hi": 0.7188
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.622,
+      "min_kappa": 0.5672,
+      "max_kappa": 0.7188,
+      "range": 0.1516
+    },
+    {
+      "judge_a": "Qwen3.6-35B",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.6875,
+        "de": 0.5265,
+        "es": 0.5339,
+        "fr": 0.6134,
+        "hi": 0.682
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.6087,
+      "min_kappa": 0.5265,
+      "max_kappa": 0.6875,
+      "range": 0.161
+    },
+    {
+      "judge_a": "GPT-OSS-120b",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.6126,
+        "de": 0.5327,
+        "es": 0.5427,
+        "fr": 0.5386,
+        "hi": 0.6779
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.5809,
+      "min_kappa": 0.5327,
+      "max_kappa": 0.6779,
+      "range": 0.1452
+    },
+    {
+      "judge_a": "MiniMax-M2.7",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.6464,
+        "de": 0.5051,
+        "es": 0.5189,
+        "fr": 0.5458,
+        "hi": 0.591
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.5614,
+      "min_kappa": 0.5051,
+      "max_kappa": 0.6464,
+      "range": 0.1413
+    },
+    {
+      "judge_a": "gemini-2.5-flash",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.5501,
+        "de": 0.5296,
+        "es": 0.5259,
+        "fr": 0.5714,
+        "hi": 0.6053
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.5565,
+      "min_kappa": 0.5259,
+      "max_kappa": 0.6053,
+      "range": 0.0794
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "meta/llama-3.3-70b-instruct-maas",
+      "per_lang": {
+        "en": 0.3897,
+        "de": 0.2832,
+        "es": 0.2853,
+        "fr": 0.303,
+        "hi": 0.3834
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.3289,
+      "min_kappa": 0.2832,
+      "max_kappa": 0.3897,
+      "range": 0.1065
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "GPT-OSS-120b",
+      "per_lang": {
+        "en": 0.431,
+        "de": 0.254,
+        "es": 0.1721,
+        "fr": 0.2151,
+        "hi": 0.491
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.3126,
+      "min_kappa": 0.1721,
+      "max_kappa": 0.491,
+      "range": 0.3189
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "MiniMax-M2.7",
+      "per_lang": {
+        "en": 0.4614,
+        "de": 0.2104,
+        "es": 0.1315,
+        "fr": 0.2639,
+        "hi": 0.4632
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.3061,
+      "min_kappa": 0.1315,
+      "max_kappa": 0.4632,
+      "range": 0.3317
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "google/gemma-4-26b-a4b-it-maas",
+      "per_lang": {
+        "en": 0.3613,
+        "de": 0.205,
+        "es": 0.0976,
+        "fr": 0.2113,
+        "hi": 0.5039
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.2758,
+      "min_kappa": 0.0976,
+      "max_kappa": 0.5039,
+      "range": 0.4063
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "Qwen3.6-35B",
+      "per_lang": {
+        "en": 0.3284,
+        "de": 0.175,
+        "es": 0.1075,
+        "fr": 0.2182,
+        "hi": 0.47
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.2598,
+      "min_kappa": 0.1075,
+      "max_kappa": 0.47,
+      "range": 0.3625
+    },
+    {
+      "judge_a": "Apertus-8B",
+      "judge_b": "gemini-2.5-flash",
+      "per_lang": {
+        "en": 0.3359,
+        "de": 0.1994,
+        "es": 0.1169,
+        "fr": 0.2513,
+        "hi": 0.3868
+      },
+      "n_langs": 5,
+      "mean_kappa": 0.2581,
+      "min_kappa": 0.1169,
+      "max_kappa": 0.3868,
+      "range": 0.2699
+    }
+  ]
+}
