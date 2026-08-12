@@ -12,6 +12,7 @@ from collections import Counter
 from typing import Any
 
 
+
 SUPPORTED     = "Supported"
 NOT_SUPPORTED = "Not Supported"
 ENCODE = {SUPPORTED: 1, NOT_SUPPORTED: 0}
