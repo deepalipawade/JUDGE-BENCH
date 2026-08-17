@@ -36,7 +36,7 @@ except ImportError:
 import config
 from utils.aggregation import (
     DECODE, ENCODE, extract_vote_matrix,
-    run_dawid_skene, run_isp, run_majority, run_owi,
+    run_dawid_skene, run_isp, run_iwmv, run_majority, run_owi,
 )
 from utils.mace import run_mace
 from utils.api import (
@@ -49,8 +49,17 @@ from utils.metrics import (
     fmt, kappa_from_lists, pct, print_metrics_table,
 )
 
-ROOT         = Path(__file__).resolve().parents[2]
-RESULTS_ROOT = ROOT / "results_tmp" / "memerag_ext"
+ROOT = Path(__file__).resolve().parents[2]
+
+_RESULTS_ROOTS = {
+    "memerag": ROOT / "results_tmp" / "memerag_ext",
+    "qags":    ROOT / "results_tmp" / "qags",
+}
+
+def _results_root() -> Path:
+    return _RESULTS_ROOTS.get(getattr(config, "DATASET", "memerag"), _RESULTS_ROOTS["memerag"])
+
+RESULTS_ROOT = ROOT / "results_tmp" / "memerag_ext"   # kept for any legacy direct references
 
 AGGREGATOR_PROMPT = (
     "You are a strict factual-consistency evaluator.\n"
@@ -125,20 +134,38 @@ def active_proposers() -> list[str]:
 
 
 def out_dir(lang: str) -> Path:
-    base = RESULTS_ROOT / lang
+    base = _results_root() / lang
     if config.EXCLUDE_MODEL:
         short = config.EXCLUDE_MODEL.split("/")[-1].lower().replace(".", "_").replace("-", "_")
         return base / f"excl_{short}"
     return base
 
 
+_QAGS_LABEL_MAP = {"yes": "Supported", "no": "Not Supported"}
+
+
+def _normalize_qags_records(records: list[dict]) -> list[dict]:
+    """Convert QAGS yes/no labels → Supported/Not Supported in-place."""
+    for rec in records:
+        majority = rec.get("majority_human")
+        rec["gold_label"] = _QAGS_LABEL_MAP.get(majority, majority)
+        rec.setdefault("sample_id", rec.get("id"))
+        for m, info in (rec.get("model_outputs") or {}).items():
+            if isinstance(info, dict) and info.get("label") in _QAGS_LABEL_MAP:
+                info["label"] = _QAGS_LABEL_MAP[info["label"]]
+    return records
+
+
 def build_prompt(record: dict[str, Any], panel: list[str]) -> str:
-    context = "\n".join(f"{i+1}. {t}" for i, t in enumerate(record.get("context_texts", [])))
-    task = TASK_PROMPT.format(
-        context=context,
-        query=record.get("query", ""),
-        answer_segment=record.get("answer_segment", ""),
-    )
+    if getattr(config, "DATASET", "memerag") != "memerag":
+        task = record.get("prompt", "")
+    else:
+        context = "\n".join(f"{i+1}. {t}" for i, t in enumerate(record.get("context_texts", [])))
+        task = TASK_PROMPT.format(
+            context=context,
+            query=record.get("query", ""),
+            answer_segment=record.get("answer_segment", ""),
+        )
     responses = ""
     for m in panel:
         info   = record.get("model_outputs", {}).get(m, {})
@@ -367,7 +394,10 @@ def save_vote_matrix(
     Columns: sample_id, gold_label, <model1>, <model2>, ...
     Values:  1 = Supported, 0 = Not Supported, empty = missing
     """
-    votes_dir = ROOT / "results_tmp" / "memerag_ext" / "votes"
+    if getattr(config, "DATASET", "memerag") == "memerag":
+        votes_dir = _results_root() / "votes"
+    else:
+        votes_dir = out_dir(lang)
     votes_dir.mkdir(parents=True, exist_ok=True)
     out_path = votes_dir / f"votes_{lang}.csv"
 
@@ -415,10 +445,31 @@ def run_algo_aggregation(
             int_labels = run_majority(active_models, matrix)
 
         elif algo == "isp":
-            int_labels, isp_acc, isp_weights = run_isp(active_models, matrix)
+            int_labels, isp_cond = run_isp(active_models, matrix)
+            # Summarise cond-prob table: per model, mean P(i=1|j=0) and P(i=1|j=1) over all j≠i
+            isp_p_given_0 = {
+                m: sum(isp_cond.get((m, j, 1, 0), 0.5) for j in active_models if j != m)
+                   / (len(active_models) - 1)
+                for m in active_models
+            }
+            isp_p_given_1 = {
+                m: sum(isp_cond.get((m, j, 1, 1), 0.5) for j in active_models if j != m)
+                   / (len(active_models) - 1)
+                for m in active_models
+            }
+            isp_gap = {m: round(isp_p_given_1[m] - isp_p_given_0[m], 4) for m in active_models}
             method_params["isp"] = {
-                "per_model_accuracy": {m: round(isp_acc[m], 4) for m in active_models},
-                "per_model_weight":   {m: round(isp_weights[m], 4) for m in active_models},
+                "mean_P_i1_given_j0": {m: round(isp_p_given_0[m], 4) for m in active_models},
+                "mean_P_i1_given_j1": {m: round(isp_p_given_1[m], 4) for m in active_models},
+                "gap_P1_minus_P0":    isp_gap,
+            }
+
+        elif algo == "iwmv":
+            int_labels, iwmv_acc, iwmv_weights, iwmv_conv = run_iwmv(active_models, matrix)
+            method_params["iwmv"] = {
+                "per_model_accuracy": {m: round(iwmv_acc[m], 4) for m in active_models},
+                "per_model_weight":   {m: round(iwmv_weights[m], 4) for m in active_models},
+                "convergence":        iwmv_conv,
             }
 
         elif algo == "owi":
@@ -463,24 +514,76 @@ def run_algo_aggregation(
         print(f"bacc={fmt(bacc)}  kappa={fmt(kappa)}")
 
         # Per-model diagnostics
-        if algo == "isp":
-            print(f"    Per-model accuracy / log-weight (ISP):")
+        if algo == "majority":
+            n_items = len(next(iter(matrix.values())))
+            split_counts: dict[str, int] = {}
+            for i in range(n_items):
+                votes = [matrix[m][i] for m in active_models if matrix[m][i] is not None]
+                n1 = sum(votes); n0 = len(votes) - n1
+                key = f"{max(n1, n0)}-{min(n1, n0)}"
+                split_counts[key] = split_counts.get(key, 0) + 1
+            method_params["majority"] = {"vote_split_distribution": split_counts}
+            print(f"    Vote split distribution ({n_items} items):")
+            for split in sorted(split_counts, reverse=True):
+                cnt = split_counts[split]
+                bar = "█" * min(cnt, 40)
+                print(f"      {split}: {cnt:>4}  {bar}")
+
+        elif algo == "isp":
+            def _isp_behavior(p0: float, gap: float) -> str:
+                if p0 > 0.40:
+                    return "positive outlier"   # says Supported even when all others disagree
+                if p0 < 0.20 and gap > 0.65:
+                    return "crowd-follower"     # calibrated, high consensus-sensitivity
+                if gap < 0.50:
+                    return "low-signal"         # vote barely shifts with consensus
+                return "mild positive lean"     # slightly biased toward Supported
+
+            print(f"    Cond-prob summary (averaged over all j≠i per model) — ISP:")
+            print(f"      P(i=1|j=0): how often judge i says Supported when all others say Not Supported.")
+            print(f"      P(i=1|j=1): how often judge i says Supported when all others agree on Supported.")
+            print(f"      Gap = P(1) - P(0): larger gap → vote is more conditionally informative.")
+            print()
+            print(f"      {'Model':<44} {'P(i=1|j=0)':>11} {'P(i=1|j=1)':>11} {'Gap':>7}  Behavior")
             for m in active_models:
-                print(f"      {m:<44} acc={isp_acc[m]:.4f}  w={isp_weights[m]:.4f}")
+                beh = _isp_behavior(isp_p_given_0[m], isp_gap[m])
+                print(f"      {m:<44} {isp_p_given_0[m]:>11.4f} {isp_p_given_1[m]:>11.4f} {isp_gap[m]:>7.4f}  {beh}")
+
+        elif algo == "iwmv":
+            cv = iwmv_conv
+            conv_str = f"converged in {cv['n_iters']} iters" if cv['converged'] else f"hit max_iter={cv['n_iters']}"
+            print(f"    Per-model accuracy / log-weight (IWMV)  [{conv_str}, weight spread={cv['weight_range']:.4f}]:")
+            print(f"      Most reweighted: {cv['most_changed'].split('/')[-1]} (Δw={cv['max_weight_delta']:.4f})")
+            print()
+            for m in active_models:
+                print(f"      {m:<44} acc={iwmv_acc[m]:.4f}  w={iwmv_weights[m]:.4f}")
+
         elif algo == "owi":
             print(f"    Per-model accuracy / log-weight (OWI):")
             for m in active_models:
                 print(f"      {m:<44} acc={owi_acc[m]:.4f}  w={owi_weights[m]:.4f}")
+
         elif algo == "ds":
-            print(f"    Per-model α(sensitivity) / β(specificity) (DS):")
-            for m in active_models:
-                print(f"      {m:<44} α={ds_alpha[m]:.4f}  β={ds_beta[m]:.4f}")
+            ds_rel = {m: 0.5 * (ds_alpha[m] + ds_beta[m]) for m in active_models}
+            ranked_ds = sorted(active_models, key=lambda m: ds_rel[m], reverse=True)
+            print(f"    Per-model α / β / reliability (DS)  [reliability = (α+β)/2, higher = more trustworthy]:")
+            print()
+            print(f"      {'Model':<44} {'α(sens)':>9} {'β(spec)':>9} {'rel':>7}  rank")
+            for rank, m in enumerate(ranked_ds, 1):
+                floor = "  [floor hit]" if ds_alpha[m] < 0.505 or ds_beta[m] < 0.505 else ""
+                print(f"      {m:<44} {ds_alpha[m]:>9.4f} {ds_beta[m]:>9.4f} {ds_rel[m]:>7.4f}  {rank:<4}{floor}")
+            method_params["ds"]["per_model_reliability"] = {m: round(ds_rel[m], 4) for m in active_models}
+
         elif algo == "mace":
             method_params["mace"]["balanced_accuracy"] = pct(bacc)
             method_params["mace"]["cohen_kappa"]       = pct(kappa)
-            print(f"    Per-model competence (MACE, higher = less spamming):")
-            for m in active_models:
-                print(f"      {m:<44} competence={mace_competence[m]:.4f}")
+            ranked_mace = sorted(active_models, key=lambda m: mace_competence[m], reverse=True)
+            print(f"    Per-model competence (MACE)  [higher = more reliable, lower = more spammy]:")
+            print()
+            print(f"      {'Model':<44} {'competence':>11}  rank")
+            for rank, m in enumerate(ranked_mace, 1):
+                flag = "  [?spammer]" if mace_competence[m] < 0.30 else ""
+                print(f"      {m:<44} {mace_competence[m]:>11.4f}  {rank:<4}{flag}")
 
     # DS reliability analysis (ranking + robustness) — only if DS was run
     if ds_alpha is not None:
@@ -732,7 +835,7 @@ def save_method_kappa_json(
 ) -> None:
     """Pairwise kappa between all methods + DS reliability — matches old format."""
     # Display names matching old evaluate_memerag_results.py
-    ALGO_DISPLAY = {"majority": "MV", "owi": "OW-I", "isp": "ISP", "ds": "Dawid-Skene"}
+    ALGO_DISPLAY = {"majority": "MV", "owi": "OW-I", "isp": "ISP", "iwmv": "IWMV", "ds": "Dawid-Skene"}
 
     method_preds: dict[str, list[str | None]] = {}
     for m in proposers:
@@ -803,8 +906,9 @@ def save_metrics_csv(
     """
     FIELDS = ["kind", "name", "balanced_accuracy", "cohen_kappa", "gap"]
     ALGO_KIND    = {"majority": "majority_vote", "owi": "weighted_agg",
-                    "isp": "weighted_agg",       "ds": "weighted_agg", "mace": "weighted_agg"}
-    ALGO_DISPLAY = {"majority": "majority", "owi": "OW-I", "isp": "ISP",
+                    "isp": "weighted_agg",       "iwmv": "weighted_agg",
+                    "ds": "weighted_agg",         "mace": "weighted_agg"}
+    ALGO_DISPLAY = {"majority": "majority", "owi": "OW-I", "isp": "ISP", "iwmv": "IWMV",
                     "ds": "Dawid-Skene", "mace": "MACE"}
 
     def _pct_str(v: float | None) -> str:
@@ -891,7 +995,7 @@ def save_metrics_csv(
     order: list[tuple[str, str]] = (
         [("individual", m) for m in proposers]
         + ([("majority_vote", "majority")] if "majority" in algo_keys else [])
-        + [(ALGO_KIND[a], ALGO_DISPLAY[a]) for a in ["owi", "isp", "ds", "mace"] if a in algo_keys]
+        + [(ALGO_KIND[a], ALGO_DISPLAY[a]) for a in ["owi", "isp", "iwmv", "ds", "mace"] if a in algo_keys]
         + ([("aggregator", llm_label)] if llm_label else [])
         + list(existing_agg.keys())
     )
@@ -958,8 +1062,15 @@ def save_metrics_csv(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MEMERAG aggregation pipeline.")
-    parser.add_argument("--lang", required=True, choices=["en", "es", "de", "fr", "hi"])
+    dataset   = getattr(config, "DATASET", "memerag")
+    parser = argparse.ArgumentParser(description="Aggregation pipeline (memerag or qags).")
+    parser.add_argument(
+        "--lang",
+        required=(dataset == "memerag"),
+        choices=(["en", "es", "de", "fr", "hi"] if dataset == "memerag" else ["cnndm", "xsum"]),
+        default=config.LANG,
+        help="Language (memerag) or subset (qags: cnndm|xsum).",
+    )
     parser.add_argument("--samples", type=int, default=None,
                         help="Limit to first N records (useful for quick checks).")
     parser.add_argument("--no-llm-agg", action="store_true",
@@ -974,6 +1085,7 @@ def main() -> None:
     if args.no_llm_agg:
         config.AGGREGATOR_LLM = None
 
+    print(f"Dataset   : {dataset}")
     print(f"Lang      : {lang}")
     print(f"Proposers : {proposers}")
     print(f"Exclude   : {config.EXCLUDE_MODEL or 'none'}")
@@ -982,14 +1094,22 @@ def main() -> None:
 
     validate_config(proposers)
 
-    input_path = RESULTS_ROOT / lang / f"memerag_judgement_{lang}.json"
+    if dataset == "memerag":
+        input_path = _results_root() / lang / f"memerag_judgement_{lang}.json"
+        err_hint   = f"python judge_memerag.py --lang {lang} --all"
+    else:
+        input_path = _results_root() / lang / "qags_judgement.json"
+        err_hint   = f"python llm-experiments/qags/judge_qags.py --dataset {lang} --all"
+
     if not input_path.exists():
         print(f"\n[ERROR] Judge output not found: {input_path}")
-        print(f"  Run: python judge_memerag.py --lang {lang} --all")
+        print(f"  Run: {err_hint}")
         sys.exit(1)
 
     judge_data = load_json(input_path)
     records    = [r for r in judge_data.get("records", []) if isinstance(r, dict)]
+    if dataset != "memerag":
+        records = _normalize_qags_records(records)
     if not records:
         print(f"[ERROR] No records in {input_path}")
         sys.exit(1)

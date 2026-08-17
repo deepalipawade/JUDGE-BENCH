@@ -87,24 +87,31 @@ def _classical_mds(dist_matrix: list[list[float]]) -> list[tuple[float, float]]:
 # Shared helpers for combined kappa plots (judges + algo methods + LLM aggs)
 # ---------------------------------------------------------------------------
 
-_ALGO_KEYS  = {"majority", "owi", "isp", "ds"}
-_ALGO_ORDER = ["majority", "owi", "isp", "ds"]
+_ALGO_KEYS  = {"majority", "owi", "isp", "iwmv", "ds", "mace"}
+_ALGO_ORDER = ["majority", "owi", "isp", "iwmv", "ds", "mace"]
 
 # Map both lowercase and display-name variants → canonical key
 _ALGO_NORM: dict[str, str] = {
     "majority": "majority", "MV":          "majority",
     "owi":      "owi",      "OW-I":        "owi",
     "isp":      "isp",      "ISP":         "isp",
+    "iwmv":     "iwmv",     "IWMV":        "iwmv",
     "ds":       "ds",       "Dawid-Skene": "ds",
+    "mace":     "mace",     "MACE":        "mace",
 }
 # All name variants per canonical (for lookup across inconsistent JSON keys)
 _ALGO_VARIANTS: dict[str, list[str]] = {
     "majority": ["majority", "MV"],
     "owi":      ["owi", "OW-I"],
     "isp":      ["isp", "ISP"],
+    "iwmv":     ["iwmv", "IWMV"],
     "ds":       ["ds", "Dawid-Skene"],
+    "mace":     ["mace", "MACE"],
 }
-_ALGO_LABEL = {"majority": "MajVote", "owi": "OWI", "isp": "ISP", "ds": "Dawid-Skene"}
+_ALGO_LABEL = {
+    "majority": "MajVote", "owi": "OWI", "isp": "ISP",
+    "iwmv": "IWMV", "ds": "Dawid-Skene", "mace": "MACE",
+}
 
 
 def _norm_entity(k: str) -> str:
