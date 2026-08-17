@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import random
 import sys
@@ -34,9 +35,10 @@ except ImportError:
 
 import config
 from utils.aggregation import (
-    DECODE, extract_vote_matrix,
+    DECODE, ENCODE, extract_vote_matrix,
     run_dawid_skene, run_isp, run_majority, run_owi,
 )
+from utils.mace import run_mace
 from utils.api import (
     SERVICE_ACCOUNT_PATH, dispatch, init_clients,
 )
@@ -351,6 +353,43 @@ def _ds_reliability_analysis(
 
 
 # ---------------------------------------------------------------------------
+# Vote matrix CSV
+# ---------------------------------------------------------------------------
+
+def save_vote_matrix(
+    records: list[dict],
+    active_models: list[str],
+    matrix: dict[str, list[int | None]],
+    lang: str,
+) -> None:
+    """Save raw judge votes to results_tmp/votes/votes_{lang}.csv.
+
+    Columns: sample_id, gold_label, <model1>, <model2>, ...
+    Values:  1 = Supported, 0 = Not Supported, empty = missing
+    """
+    votes_dir = ROOT / "results_tmp" / "memerag_ext" / "votes"
+    votes_dir.mkdir(parents=True, exist_ok=True)
+    out_path = votes_dir / f"votes_{lang}.csv"
+
+    fieldnames = ["sample_id", "gold_label"] + active_models
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for i, rec in enumerate(records):
+            gold = ENCODE.get(rec.get("gold_label"))
+            row: dict[str, Any] = {
+                "sample_id":  rec.get("sample_id", ""),
+                "gold_label": "" if gold is None else gold,
+            }
+            for m in active_models:
+                lbl = matrix[m][i]
+                row[m] = "" if lbl is None else lbl
+            writer.writerow(row)
+
+    print(f"  Vote matrix  → {out_path.name}  ({len(records)} samples × {len(active_models)} models)")
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Algorithmic aggregation
 # ---------------------------------------------------------------------------
 
@@ -358,9 +397,9 @@ def run_algo_aggregation(
     records: list[dict],
     lang: str,
     proposers: list[str],
-    save: bool = True,
 ) -> tuple[list[tuple[str, float | None, float | None]], dict | None]:
     active_models, matrix = extract_vote_matrix(records, proposers)
+    save_vote_matrix(records, active_models, matrix, lang)
     table_rows: list[tuple[str, float | None, float | None]] = []
     metrics:      dict[str, Any] = {}
     method_params: dict[str, Any] = {}
@@ -396,6 +435,19 @@ def run_algo_aggregation(
                 "per_model_specificity_beta":  {m: round(ds_beta[m], 4) for m in active_models},
             }
 
+        elif algo == "mace":
+            int_labels, mace_competence, mace_entropy = run_mace(
+                active_models, matrix, random_state=config.SEED
+            )
+            method_params["mace"] = {
+                "per_model_competence": {m: round(mace_competence[m], 4) for m in active_models},
+                "method": "vb",
+                "n_restarts": 10,
+                "n_iter": 50,
+            }
+            for r, ent in zip(records, mace_entropy):
+                r["__mace_entropy"] = ent if not math.isnan(ent) else None
+
         else:
             print("unknown — skipping")
             continue
@@ -423,6 +475,12 @@ def run_algo_aggregation(
             print(f"    Per-model α(sensitivity) / β(specificity) (DS):")
             for m in active_models:
                 print(f"      {m:<44} α={ds_alpha[m]:.4f}  β={ds_beta[m]:.4f}")
+        elif algo == "mace":
+            method_params["mace"]["balanced_accuracy"] = pct(bacc)
+            method_params["mace"]["cohen_kappa"]       = pct(kappa)
+            print(f"    Per-model competence (MACE, higher = less spamming):")
+            for m in active_models:
+                print(f"      {m:<44} competence={mace_competence[m]:.4f}")
 
     # DS reliability analysis (ranking + robustness) — only if DS was run
     if ds_alpha is not None:
@@ -431,22 +489,19 @@ def run_algo_aggregation(
             active_models, matrix, ds_alpha, ds_beta, records, seed=config.SEED
         )
 
-    if save:
-        out_path = out_dir(lang) / f"algo_agg_{lang}.json"
-        save_json(out_path, {
-            "timestamp":            datetime.now(timezone.utc).isoformat(),
-            "lang":                 lang,
-            "methods":              config.AGGREGATION_ALGOS,
-            "excluded_model":       config.EXCLUDE_MODEL,
-            "models":               active_models,
-            "method_params":        method_params,
-            "ds_reliability_analysis": ds_reliability_result,
-            "records":              records,
-            "metrics":              metrics,
-        })
-        print(f"  → {out_path.name}")
-    else:
-        print(f"  [no-llm-agg] skipping save of algo_agg_{lang}.json")
+    out_path = out_dir(lang) / f"algo_agg_{lang}.json"
+    save_json(out_path, {
+        "timestamp":            datetime.now(timezone.utc).isoformat(),
+        "lang":                 lang,
+        "methods":              config.AGGREGATION_ALGOS,
+        "excluded_model":       config.EXCLUDE_MODEL,
+        "models":               active_models,
+        "method_params":        method_params,
+        "ds_reliability_analysis": ds_reliability_result,
+        "records":              records,
+        "metrics":              metrics,
+    })
+    print(f"  → {out_path.name}")
 
     return table_rows, ds_reliability_result
 
@@ -748,8 +803,9 @@ def save_metrics_csv(
     """
     FIELDS = ["kind", "name", "balanced_accuracy", "cohen_kappa", "gap"]
     ALGO_KIND    = {"majority": "majority_vote", "owi": "weighted_agg",
-                    "isp": "weighted_agg",       "ds": "weighted_agg"}
-    ALGO_DISPLAY = {"majority": "majority", "owi": "OW-I", "isp": "ISP", "ds": "Dawid-Skene"}
+                    "isp": "weighted_agg",       "ds": "weighted_agg", "mace": "weighted_agg"}
+    ALGO_DISPLAY = {"majority": "majority", "owi": "OW-I", "isp": "ISP",
+                    "ds": "Dawid-Skene", "mace": "MACE"}
 
     def _pct_str(v: float | None) -> str:
         return f"{v * 100:.2f}%" if v is not None else "n/a"
@@ -835,7 +891,7 @@ def save_metrics_csv(
     order: list[tuple[str, str]] = (
         [("individual", m) for m in proposers]
         + ([("majority_vote", "majority")] if "majority" in algo_keys else [])
-        + [(ALGO_KIND[a], ALGO_DISPLAY[a]) for a in ["owi", "isp", "ds"] if a in algo_keys]
+        + [(ALGO_KIND[a], ALGO_DISPLAY[a]) for a in ["owi", "isp", "ds", "mace"] if a in algo_keys]
         + ([("aggregator", llm_label)] if llm_label else [])
         + list(existing_agg.keys())
     )
@@ -960,11 +1016,12 @@ def main() -> None:
     algo_keys:            list[str] = []
     llm_preds:            dict[str, str | None] | None = None
     llm_row_label:        str = "llm_agg"
+    retry_hint:           str | None = None
 
     # ── Step 1: Algorithmic aggregation ──────────────────────────────────
     if config.AGGREGATION_ALGOS:
         print(f"\n{'='*60}\nALGORITHMIC AGGREGATION\n{'='*60}")
-        algo_rows, ds_reliability_result = run_algo_aggregation(records, lang, proposers, save=not args.no_llm_agg)
+        algo_rows, ds_reliability_result = run_algo_aggregation(records, lang, proposers)
         all_results.extend(algo_rows)
         algo_keys = list(config.AGGREGATION_ALGOS)
 
@@ -998,20 +1055,17 @@ def main() -> None:
 
     # ── Method pairwise kappa + CSV ───────────────────────────────────────
     print(f"\n{'='*60}\nOUTPUT FILES\n{'='*60}")
-    if args.no_llm_agg:
-        print("  [no-llm-agg] skipping save of method_kappa and metrics_summary CSV")
-    else:
-        if algo_keys or llm_preds:
-            save_method_kappa_json(
-                records, proposers, algo_keys, lang,
-                llm_preds, llm_row_label, ds_reliability_result,
-            )
-        save_metrics_csv(
+    if algo_keys or llm_preds:
+        save_method_kappa_json(
             records, proposers, algo_keys, lang,
-            llm_label=llm_row_label if llm_preds else None,
-            llm_sid_to_label=llm_preds,
-            ds_reliability_result=ds_reliability_result,
+            llm_preds, llm_row_label, ds_reliability_result,
         )
+    save_metrics_csv(
+        records, proposers, algo_keys, lang,
+        llm_label=llm_row_label if llm_preds else None,
+        llm_sid_to_label=llm_preds,
+        ds_reliability_result=ds_reliability_result,
+    )
 
     if retry_hint:
         print(f"\n{'='*60}")

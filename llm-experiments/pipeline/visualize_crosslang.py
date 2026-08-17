@@ -435,22 +435,29 @@ def plot_agg_override_crosslang(langs: list[str]) -> None:
             continue
         methods = load_json(p).get("methods", {})
         filtered = {k: v for k, v in methods.items() if k in FOCUS}
-        if filtered:
-            lang_data[lang] = filtered
+        if not filtered:
+            continue
+        feat_p = RESULTS_ROOT / lang / f"analysis_agg_features_{lang}.json"
+        best_model = None
+        if feat_p.exists():
+            ms = load_json(feat_p).get("method_summary", {})
+            best_model = ms.get("best_bacc", {}).get("model_selected")
+        lang_data[lang] = {"methods": filtered, "best_model": best_model}
 
     if not lang_data:
         print("  [SKIP] agg override — no analysis_agg_override files found")
         return
 
-    COLORS = {"random": "#90A4AE", "best_bacc": "#66BB6A"}
 
     cols = 3
     rows = math.ceil(len(lang_data) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.0, rows * 4.0))
     axes_flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
 
-    for idx, (lang, methods) in enumerate(lang_data.items()):
-        ax = axes_flat[idx]
+    for idx, (lang, entry) in enumerate(lang_data.items()):
+        ax         = axes_flat[idx]
+        methods    = entry["methods"]
+        best_model = entry["best_model"]
 
         present  = [m for m in FOCUS if m in methods]
         n        = len(present)
@@ -467,7 +474,6 @@ def plot_agg_override_crosslang(langs: list[str]) -> None:
             improved = d.get("override_improved", 0)
             hurt     = d.get("override_hurt", 0)
             net      = d.get("override_net_gain", 0)
-            color    = COLORS[method]
             cx       = gi  # centre of this method's group
 
             ax.bar(cx - bar_w / 2, improved, width=bar_w, color="#4CAF50",
@@ -475,8 +481,6 @@ def plot_agg_override_crosslang(langs: list[str]) -> None:
             ax.bar(cx + bar_w / 2, hurt, width=bar_w, color="#EF5350",
                    edgecolor="white", linewidth=0.5)
 
-            # Method label below x-axis handled by set_xticklabels
-            # Net gain badge centred over group
             sign  = "+" if net > 0 else ("−" if net < 0 else "")
             badge = f"net {sign}{abs(net)}"
             ax.text(cx, ymax * 1.08, badge, ha="center", va="bottom",
@@ -484,10 +488,16 @@ def plot_agg_override_crosslang(langs: list[str]) -> None:
                     color="#2E7D32" if net > 0 else ("#C62828" if net < 0 else "#555"),
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#ccc", lw=0.6))
 
+        # Build x-axis tick labels: show best_bacc model name for the best_bacc bar
+        def _xtick(m: str) -> str:
+            if m == "best_bacc" and best_model:
+                return f"best\nbacc\n({_short(best_model)})"
+            return m.replace("_", "\n")
+
         ax.set_title(lang.upper(), fontsize=10, fontweight="bold", pad=5)
         ax.set_xticks(list(range(n)))
-        ax.set_xticklabels([m.replace("_", "\n") for m in present], fontsize=9)
-        ax.set_ylabel("# override events", fontsize=8.5)
+        ax.set_xticklabels([_xtick(m) for m in present], fontsize=8)
+        ax.set_ylabel("# disagreements (agg ≠ majority)", fontsize=8.5)
         ax.set_ylim(0, ymax * 1.38)
         ax.tick_params(axis="both", labelsize=8.5)
         ax.grid(axis="y", linestyle="--", alpha=0.3, linewidth=0.6)
@@ -502,7 +512,7 @@ def plot_agg_override_crosslang(langs: list[str]) -> None:
     fig.legend(handles=legend_handles, fontsize=9, loc="lower center",
                ncol=2, bbox_to_anchor=(0.5, -0.04), framealpha=0.9)
     fig.suptitle(
-        "When aggregator overrides majority vote — random vs best_bacc\n"
+        "When aggregator disagrees with majority vote — random vs best_bacc\n"
         "Green = aggregator correct  |  Red = aggregator wrong  |  net = improved − hurt",
         fontsize=11, fontweight="bold",
     )
@@ -694,7 +704,7 @@ def plot_majority_accuracy_by_split_crosslang(langs: list[str]) -> None:
         axes_flat[idx].set_visible(False)
 
     fig.suptitle(
-        "Does vote confidence predict majority accuracy?\n"
+        "Majority vote accuracy drops as judge disagreement increases\n"
         "% of samples where majority vote == gold label, by split level",
         fontsize=12, fontweight="bold",
     )
@@ -716,7 +726,7 @@ def plot_kappa_heatmap_crosslang(langs: list[str]) -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
-        import numpy as np
+        import numpy as np  # noqa: F401
     except ImportError as e:
         print(f"  [SKIP] kappa heatmap — missing {e}")
         return
@@ -798,6 +808,425 @@ def plot_kappa_heatmap_crosslang(langs: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 9. Co-dissent heatmap — which models form the 4-3 minority together?
+# ---------------------------------------------------------------------------
+
+def plot_codissent_heatmap_crosslang(langs: list[str]) -> None:
+    """
+    For every 4-3 vote split, 3 models are always in the minority together.
+    This heatmap shows how often each pair of models co-appeared in that minority.
+
+    Cell (i, j) = # 4-3 cases where both model i AND model j were in the minority.
+    Diagonal    = total # 4-3 cases where that model was in the minority.
+    High off-diagonal value → those two models form a recurring dissenting faction.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        print(f"  [SKIP] co-dissent heatmap — missing {e}")
+        return
+
+    PROPOSERS = [
+        "Qwen3.6-35B",
+        "google/gemma-4-26b-a4b-it-maas",
+        "MiniMax-M2.7",
+        "GPT-OSS-120b",
+        "meta/llama-3.3-70b-instruct-maas",
+        "gemini-2.5-flash",
+        "Apertus-8B",
+    ]
+    LABEL_MAP = {"Supported": 1, "Not Supported": 0}
+    n = len(PROPOSERS)
+    idx_of = {m: i for i, m in enumerate(PROPOSERS)}
+    short  = [_short(m) for m in PROPOSERS]
+
+    lang_mats: dict[str, list] = {}
+    lang_n43:  dict[str, int]  = {}
+
+    for lang in langs:
+        p = RESULTS_ROOT / lang / f"memerag_judgement_{lang}.json"
+        if not p.exists():
+            continue
+        records = load_json(p).get("records", [])
+
+        mat   = [[0] * n for _ in range(n)]
+        n_43  = 0
+
+        for rec in records:
+            outs = rec.get("model_outputs", {})
+            labels = {}
+            for m in PROPOSERS:
+                out = outs.get(m)
+                if out:
+                    lbl = LABEL_MAP.get(out.get("label"))
+                    if lbl is not None:
+                        labels[m] = lbl
+
+            if len(labels) < 7:
+                continue
+
+            n_sup = sum(labels.values())
+            n_not = 7 - n_sup
+
+            # Only 4-3 splits (minority = the 3-model side)
+            if n_sup != 3 and n_not != 3:
+                continue
+
+            minority_val  = 1 if n_sup == 3 else 0
+            minority_mods = [m for m in PROPOSERS if labels.get(m) == minority_val]
+
+            if len(minority_mods) != 3:
+                continue
+
+            n_43 += 1
+            for ia_idx, ma in enumerate(minority_mods):
+                for mb in minority_mods[ia_idx:]:
+                    ia = idx_of[ma]
+                    ib = idx_of[mb]
+                    mat[ia][ib] += 1
+                    if ia != ib:
+                        mat[ib][ia] += 1
+
+        if n_43 > 0:
+            lang_mats[lang] = mat
+            lang_n43[lang]  = n_43
+
+    if not lang_mats:
+        print("  [SKIP] co-dissent heatmap — no judgement files found")
+        return
+
+    cols = 3
+    rows = math.ceil(len(lang_mats) / cols)
+    fig, axes = plt.subplots(rows, cols,
+                             figsize=(cols * 4.5, rows * 4.2),
+                             constrained_layout=True)
+    axes_flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+
+    for idx, (lang, mat) in enumerate(lang_mats.items()):
+        ax = axes_flat[idx]
+
+        # Off-diagonal max (diagonal is always higher; don't let it dominate colorscale)
+        off_vals = [mat[i][j] for i in range(n) for j in range(n) if i != j]
+        vmax = max(off_vals) if off_vals else 1
+
+        im = ax.imshow(mat, cmap="YlOrRd", vmin=0, vmax=vmax, aspect="auto")
+
+        for i in range(n):
+            for j in range(n):
+                val = mat[i][j]
+                text_color = "white" if val > vmax * 0.65 else "black"
+                ax.text(j, i, str(val), ha="center", va="center",
+                        fontsize=7, color=text_color,
+                        fontweight="bold" if i == j else "normal")
+
+        ax.set_xticks(range(n))
+        ax.set_xticklabels(short, rotation=40, ha="right", fontsize=7.5)
+        ax.set_yticks(range(n))
+        ax.set_yticklabels(short, fontsize=7.5)
+        ax.set_title(f"{lang.upper()}  ({lang_n43[lang]} 4-3 cases)",
+                     fontsize=10, fontweight="bold", pad=5)
+
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=7)
+
+    for idx in range(len(lang_mats), rows * cols):
+        axes_flat[idx].set_visible(False)
+
+    fig.suptitle(
+        "4-3 minority co-dissent — which models appear in the minority TOGETHER?\n"
+        "Cell (i,j) = # cases where both i and j were in the 3-model minority side\n"
+        "Diagonal = total 4-3 cases that model was in minority  |  high off-diagonal → recurring faction",
+        fontsize=11, fontweight="bold",
+    )
+    _save(fig, "codissent_heatmap_crosslang.png")
+
+
+# ---------------------------------------------------------------------------
+# Error correlation helpers + 3 views
+# ---------------------------------------------------------------------------
+
+_PROPOSERS_EC = [
+    "Qwen3.6-35B",
+    "google/gemma-4-26b-a4b-it-maas",
+    "MiniMax-M2.7",
+    "GPT-OSS-120b",
+    "meta/llama-3.3-70b-instruct-maas",
+    "gemini-2.5-flash",
+    "Apertus-8B",
+]
+_LABEL_MAP_EC = {"Supported": 1, "Not Supported": 0}
+
+
+def _compute_error_matrices(langs: list[str]) -> dict[str, tuple]:
+    """
+    Returns {lang: (matrix, short_names, n_samples)}.
+    matrix[i][j] = fraction of samples where both model_i AND model_j were wrong.
+    Diagonal = individual error rate of model_i.
+    """
+    result = {}
+    n = len(_PROPOSERS_EC)
+    for lang in langs:
+        p = RESULTS_ROOT / lang / f"memerag_judgement_{lang}.json"
+        if not p.exists():
+            continue
+        records   = load_json(p).get("records", [])
+        co_error  = [[0] * n for _ in range(n)]
+        total     = 0
+        for rec in records:
+            gold = _LABEL_MAP_EC.get(rec.get("gold_label"))
+            if gold is None:
+                continue
+            outs  = rec.get("model_outputs", {})
+            wrong = []
+            valid = True
+            for m in _PROPOSERS_EC:
+                out = outs.get(m)
+                if not out:
+                    valid = False; break
+                lbl = _LABEL_MAP_EC.get(out.get("label"))
+                if lbl is None:
+                    valid = False; break
+                wrong.append(lbl != gold)
+            if not valid:
+                continue
+            total += 1
+            for i in range(n):
+                for j in range(i, n):
+                    if wrong[i] and wrong[j]:
+                        co_error[i][j] += 1
+                        if i != j:
+                            co_error[j][i] += 1
+        if total > 0:
+            mat   = [[co_error[i][j] / total for j in range(n)] for i in range(n)]
+            short = [_short(m) for m in _PROPOSERS_EC]
+            result[lang] = (mat, short, total)
+    return result
+
+
+# 10b. Per-model average error overlap
+def plot_error_overlap_per_model_crosslang(langs: list[str]) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        print(f"  [SKIP] error overlap per model — {e}"); return
+
+    matrices = _compute_error_matrices(langs)
+    if not matrices:
+        print("  [SKIP] error overlap per model — no data"); return
+
+    n_models  = len(_PROPOSERS_EC)
+    palette   = plt.cm.tab10.colors
+    mod_color = {_short(m): palette[i % len(palette)]
+                 for i, m in enumerate(_PROPOSERS_EC)}
+
+    cols = 3
+    rows = math.ceil(len(matrices) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.2, rows * 3.8),
+                             constrained_layout=True)
+    axes_flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+
+    for idx, (lang, (mat, short, total)) in enumerate(matrices.items()):
+        ax = axes_flat[idx]
+
+        # Average overlap of each model with all others (off-diagonal mean)
+        avgs = []
+        for i in range(n_models):
+            others = [mat[i][j] for j in range(n_models) if j != i]
+            avgs.append(sum(others) / len(others))
+
+        order  = sorted(range(n_models), key=lambda k: avgs[k], reverse=True)
+        labels = [short[k] for k in order]
+        values = [avgs[k]  for k in order]
+        colors = [mod_color[short[k]] for k in order]
+
+        y = list(range(n_models))
+        ax.barh(y, values, color=colors, edgecolor="white", linewidth=0.4, height=0.6)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("Mean error overlap with others", fontsize=8.5)
+        ax.set_title(f"{lang.upper()}  (n={total})", fontsize=10, fontweight="bold")
+        ax.grid(axis="x", linestyle="--", alpha=0.3, linewidth=0.6)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.invert_yaxis()
+
+        for yi, v in zip(y, values):
+            ax.text(v + max(values) * 0.01, yi, f"{v:.3f}",
+                    va="center", fontsize=7, color="#333")
+
+    for idx in range(len(matrices), rows * cols):
+        axes_flat[idx].set_visible(False)
+
+    fig.suptitle(
+        "Per-model mean error overlap — all languages\n"
+        "High value = model's errors are shared with many others  |  "
+        "Low value = model fails on unique samples",
+        fontsize=12, fontweight="bold",
+    )
+    _save(fig, "error_overlap_per_model_crosslang.png")
+
+
+# 10c. Dendrogram — cluster models by error similarity
+def plot_error_overlap_dendrogram_crosslang(langs: list[str]) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        from scipy.cluster.hierarchy import linkage, dendrogram
+        from scipy.spatial.distance import squareform
+        import numpy as np
+    except ImportError as e:
+        print(f"  [SKIP] error dendrogram — {e}"); return
+
+    matrices = _compute_error_matrices(langs)
+    if not matrices:
+        print("  [SKIP] error dendrogram — no data"); return
+
+    cols = 3
+    rows = math.ceil(len(matrices) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.5, rows * 4.0),
+                             constrained_layout=True)
+    axes_flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+
+    for idx, (lang, (mat, short, total)) in enumerate(matrices.items()):
+        ax = axes_flat[idx]
+
+        # Convert overlap (similarity) to distance: d = 1 - overlap / max_overlap
+        np_mat = np.array(mat)
+        # Use off-diagonal max as normaliser
+        off_diag = np_mat.copy()
+        np.fill_diagonal(off_diag, 0)
+        max_val  = off_diag.max() or 1.0
+        dist_mat = 1.0 - (off_diag / max_val)
+        np.fill_diagonal(dist_mat, 0.0)
+
+        condensed = squareform(dist_mat)
+        Z = linkage(condensed, method="average")
+
+        dendrogram(
+            Z,
+            labels=short,
+            orientation="left",
+            ax=ax,
+            color_threshold=0,
+            above_threshold_color="#4A90D9",
+            leaf_font_size=8,
+        )
+        ax.set_title(f"{lang.upper()}  (n={total})", fontsize=10, fontweight="bold")
+        ax.set_xlabel("Distance (1 − normalised error overlap)", fontsize=8)
+        ax.tick_params(axis="both", labelsize=7.5)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+
+    for idx in range(len(matrices), rows * cols):
+        axes_flat[idx].set_visible(False)
+
+    fig.suptitle(
+        "Error similarity clustering — all languages\n"
+        "Models that branch together share similar error patterns across samples",
+        fontsize=12, fontweight="bold",
+    )
+    _save(fig, "error_overlap_dendrogram_crosslang.png")
+
+
+# ---------------------------------------------------------------------------
+# Method BAcc / Kappa comparison across languages
+# ---------------------------------------------------------------------------
+
+def plot_method_bacc_kappa_crosslang(langs: list[str]) -> None:
+    """Grouped bar chart: BAcc (top) and Kappa (bottom) per aggregation method per language.
+
+    Data source: algo_agg_{lang}.json → metrics section.
+    Methods shown: majority, owi, isp, ds, mace (any subset present in the JSON).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError as e:
+        print(f"  [SKIP] method BAcc/Kappa — missing {e}")
+        return
+
+    METHOD_LABELS = {
+        "majority": "Majority",
+        "owi":      "OWI",
+        "isp":      "ISP",
+        "ds":       "Dawid-Skene",
+        "mace":     "MACE",
+    }
+    METHOD_ORDER = ["majority", "owi", "isp", "ds", "mace"]
+    COLORS = ["#90A4AE", "#64B5F6", "#4DB6AC", "#FF8A65", "#BA68C8"]
+
+    # Collect data: {lang: {method: {bacc, kappa}}}
+    lang_data: dict[str, dict[str, dict]] = {}
+    for lang in langs:
+        p = RESULTS_ROOT / lang / f"algo_agg_{lang}.json"
+        if not p.exists():
+            continue
+        raw = load_json(p).get("metrics", {})
+        if not raw:
+            continue
+        lang_data[lang] = {
+            m: {"bacc": raw[m].get("balanced_accuracy"), "kappa": raw[m].get("cohen_kappa")}
+            for m in METHOD_ORDER if m in raw
+        }
+
+    if not lang_data:
+        print("  [SKIP] method BAcc/Kappa — no algo_agg files found")
+        return
+
+    present_methods = [m for m in METHOD_ORDER
+                       if any(m in d for d in lang_data.values())]
+    lang_list  = list(lang_data.keys())
+    n_langs    = len(lang_list)
+    n_methods  = len(present_methods)
+    x          = np.arange(n_langs)
+    bar_w      = 0.8 / n_methods
+
+    fig, (ax_bacc, ax_kappa) = plt.subplots(2, 1, figsize=(max(7, n_langs * 1.6), 7),
+                                             sharex=True)
+
+    for mi, method in enumerate(present_methods):
+        offset = (mi - n_methods / 2 + 0.5) * bar_w
+        color  = COLORS[mi % len(COLORS)]
+        label  = METHOD_LABELS.get(method, method)
+
+        baccs  = [lang_data[lg].get(method, {}).get("bacc") for lg in lang_list]
+        kappas = [lang_data[lg].get(method, {}).get("kappa") for lg in lang_list]
+
+        for ax, vals in ((ax_bacc, baccs), (ax_kappa, kappas)):
+            for i, v in enumerate(vals):
+                if v is None:
+                    continue
+                # pct string ("84.17%") or float
+                num = float(str(v).rstrip("%")) if v is not None else None
+                bar = ax.bar(x[i] + offset, num, bar_w * 0.9,
+                             color=color, label=label if i == 0 else None,
+                             edgecolor="white", linewidth=0.4)
+                ax.text(x[i] + offset, num + 0.3, f"{num:.1f}",
+                        ha="center", va="bottom", fontsize=6.5, rotation=90)
+
+    for ax, metric in ((ax_bacc, "Balanced Accuracy (%)"), (ax_kappa, "Cohen's Kappa (%)")):
+        ax.set_ylabel(metric, fontsize=9)
+        ax.set_ylim(0, ax.get_ylim()[1] * 1.15)
+        ax.set_xticks(x)
+        ax.set_xticklabels([lg.upper() for lg in lang_list], fontsize=10)
+        ax.tick_params(axis="y", labelsize=8)
+        ax.grid(axis="y", linestyle="--", alpha=0.3, linewidth=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    ax_bacc.legend(
+        handles=[plt.Rectangle((0, 0), 1, 1, color=COLORS[i])
+                 for i, m in enumerate(present_methods)],
+        labels=[METHOD_LABELS.get(m, m) for m in present_methods],
+        fontsize=8, ncol=n_methods, loc="upper right",
+        framealpha=0.85, handlelength=1.2,
+    )
+
+    fig.suptitle(
+        "Aggregation method comparison across languages\n"
+        "BAcc and Kappa for Majority, OWI, ISP, Dawid-Skene, MACE",
+        fontsize=11, fontweight="bold",
+    )
+    fig.tight_layout()
+    _save(fig, "method_bacc_kappa_crosslang.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -820,12 +1249,16 @@ def main() -> None:
     print(f"[CROSS-LANG] languages: {langs}")
     plot_vote_splits_crosslang(langs)
     plot_dissenter_by_split_crosslang(langs)
+    plot_codissent_heatmap_crosslang(langs)
     plot_dissenter_crosslang(langs)
     plot_judge_leniency_crosslang(langs)
     plot_agg_override_crosslang(langs)
     plot_individual_vs_agg_bacc_crosslang(langs)
     plot_majority_accuracy_by_split_crosslang(langs)
     plot_kappa_heatmap_crosslang(langs)
+    plot_error_overlap_per_model_crosslang(langs)
+    plot_error_overlap_dendrogram_crosslang(langs)
+    plot_method_bacc_kappa_crosslang(langs)
 
 
 if __name__ == "__main__":
