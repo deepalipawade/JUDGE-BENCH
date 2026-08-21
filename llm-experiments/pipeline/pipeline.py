@@ -1062,12 +1062,27 @@ def save_metrics_csv(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    dataset   = getattr(config, "DATASET", "memerag")
+    # Pre-parse --dataset before building the full parser so --lang choices are correct.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--dataset", default=getattr(config, "DATASET", "memerag"))
+    _pre_args, _ = _pre.parse_known_args()
+    dataset = _pre_args.dataset
+    config.DATASET = dataset  # propagate CLI override into config module
+
+    _LANG_CHOICES = {
+        "memerag": ["en", "es", "de", "fr", "hi"],
+        "qags":    ["cnndm", "xsum"],
+    }
+    lang_choices = _LANG_CHOICES.get(dataset, ["en", "es", "de", "fr", "hi"])
+
     parser = argparse.ArgumentParser(description="Aggregation pipeline (memerag or qags).")
+    parser.add_argument("--dataset", default=dataset,
+                        choices=list(_LANG_CHOICES.keys()),
+                        help="Dataset to run (default: from config.py).")
     parser.add_argument(
         "--lang",
-        required=(dataset == "memerag"),
-        choices=(["en", "es", "de", "fr", "hi"] if dataset == "memerag" else ["cnndm", "xsum"]),
+        required=True,
+        choices=lang_choices,
         default=config.LANG,
         help="Language (memerag) or subset (qags: cnndm|xsum).",
     )
