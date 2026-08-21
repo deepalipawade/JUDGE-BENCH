@@ -78,24 +78,35 @@ def run_majority(
 
 
 # ---------------------------------------------------------------------------
-# ISP  (Iterative Soft Pseudo-labeling — arXiv:2510.01499)
+# IWMV  (Iterative Weighted Majority Vote — previously mislabeled as ISP)
 # ---------------------------------------------------------------------------
 
-def run_isp(
+def run_iwmv(
     models: list[str],
     matrix: dict[str, list[int | None]],
     max_iter: int = 20,
     eps: float = 1e-6,
-) -> tuple[list[int | None], dict[str, float], dict[str, float]]:
-    """Returns (hard_labels, accuracies, weights)."""
+) -> tuple[list[int | None], dict[str, float], dict[str, float], dict]:
+    """Returns (hard_labels, accuracies, weights, conv_info).
+
+    conv_info keys:
+      n_iters          — iterations until convergence (or max_iter if not converged)
+      converged        — whether convergence criterion was met
+      weight_range     — max(w) - min(w): spread of final weights across models
+      most_changed     — model whose weight changed most from iter-1 to final
+      max_weight_delta — magnitude of that change
+    """
     n = len(next(iter(matrix.values())))
     mv = _majority_vote(_votes_by_sample(models, matrix))
     soft: list[float] = [0.8 if v == 1 else (0.2 if v == 0 else 0.5) for v in mv]
 
     accuracies: dict[str, float] = {}
     weights:    dict[str, float] = {}
+    init_weights: dict[str, float] = {}
+    n_iters_done = max_iter
+    converged    = False
 
-    for _ in range(max_iter):
+    for it in range(max_iter):
         old_soft = list(soft)
         for m in models:
             num = denom = 0.0
@@ -111,6 +122,8 @@ def run_isp(
         for m in models:
             a = accuracies[m]
             weights[m] = math.log(a / (1.0 - a))
+        if it == 0:
+            init_weights = dict(weights)
         for i in range(n):
             score = 0.0
             for m in models:
@@ -120,10 +133,101 @@ def run_isp(
                 score += weights[m] if v == 1 else -weights[m]
             soft[i] = 1.0 / (1.0 + math.exp(-score))
         if max(abs(a - b) for a, b in zip(soft, old_soft)) < eps:
+            n_iters_done = it + 1
+            converged    = True
             break
 
+    weight_deltas = {m: abs(weights[m] - init_weights.get(m, weights[m])) for m in models}
+    most_changed  = max(weight_deltas, key=weight_deltas.get)
+    conv_info = {
+        "n_iters":          n_iters_done,
+        "converged":        converged,
+        "weight_range":     round(max(weights.values()) - min(weights.values()), 4),
+        "most_changed":     most_changed,
+        "max_weight_delta": round(weight_deltas[most_changed], 4),
+    }
+
     hard: list[int | None] = [1 if p > 0.5 else (0 if p < 0.5 else None) for p in soft]
-    return hard, accuracies, weights
+    return hard, accuracies, weights, conv_info
+
+
+# ---------------------------------------------------------------------------
+# ISP  (Inverse Surprising Popularity — Algorithm 2, arXiv:2510.01499)
+# ---------------------------------------------------------------------------
+
+def _compute_conditional_probs(
+    models: list[str],
+    matrix: dict[str, list[int | None]],
+    eps: float = 1e-6,
+) -> dict[tuple[str, str, int, int], float]:
+    """P(judge_i = k | judge_j = l) for every ordered pair (i,j) and label pair (k,l)."""
+    n = len(next(iter(matrix.values())))
+    cond: dict[tuple[str, str, int, int], float] = {}
+    for mi in models:
+        for mj in models:
+            if mi == mj:
+                continue
+            for l in (0, 1):
+                count_l = count_k1 = 0
+                for t in range(n):
+                    vi, vj = matrix[mi][t], matrix[mj][t]
+                    if vi is None or vj is None:
+                        continue
+                    if vj == l:
+                        count_l += 1
+                        if vi == 1:
+                            count_k1 += 1
+                p1 = count_k1 / count_l if count_l > 0 else 0.5
+                cond[(mi, mj, 1, l)] = max(eps, min(1 - eps, p1))
+                cond[(mi, mj, 0, l)] = 1.0 - cond[(mi, mj, 1, l)]
+    return cond
+
+
+def run_isp(
+    models: list[str],
+    matrix: dict[str, list[int | None]],
+) -> tuple[list[int | None], dict[tuple[str, str, int, int], float]]:
+    """Real ISP for K=2 (Algorithm 2, Ai/Pan et al. arXiv:2510.01499).
+
+    AdvISP(s) = (# judges who voted s) - sum_i mean_{j≠i} P(i says s | j says 1-vote_j)
+    Label = argmax_s AdvISP(s).
+
+    Returns (labels, conditional_prob_table).
+    Note: no per-model accuracy/weight outputs — ISP aggregates at the item level.
+    """
+    n    = len(next(iter(matrix.values())))
+    cond = _compute_conditional_probs(models, matrix)
+
+    labels: list[int | None] = []
+    for t in range(n):
+        votes_t = {m: matrix[m][t] for m in models}
+        valid   = [m for m in models if votes_t[m] is not None]
+        if len(valid) < 2:
+            labels.append(None)
+            continue
+
+        adv: dict[int, float] = {}
+        for s in (0, 1):
+            vote_count = sum(1 for m in valid if votes_t[m] == s)
+            sisp_sum   = 0.0
+            for i in valid:
+                others = [j for j in valid if j != i]
+                if not others:
+                    continue
+                # Counterfactual: how often would i predict s if each j had said the opposite?
+                sisp_sum += sum(
+                    cond.get((i, j, s, 1 - votes_t[j]), 0.5) for j in others
+                ) / len(others)
+            adv[s] = vote_count - sisp_sum
+
+        if adv[1] > adv[0]:
+            labels.append(1)
+        elif adv[0] > adv[1]:
+            labels.append(0)
+        else:
+            labels.append(None)
+
+    return labels, cond
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +239,8 @@ def run_owi(
     matrix: dict[str, list[int | None]],
     eps: float = 1e-6,
 ) -> tuple[list[int | None], dict[str, float], dict[str, float]]:
-    """Uses ISP pseudo-labels as reference. Returns (labels, accuracies, weights)."""
-    isp_labels, _, _ = run_isp(models, matrix)
+    """Uses real ISP pseudo-labels as reference. Returns (labels, accuracies, weights)."""
+    isp_labels, _ = run_isp(models, matrix)
     n = len(next(iter(matrix.values())))
 
     accuracies: dict[str, float] = {}

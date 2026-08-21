@@ -39,7 +39,10 @@ LABELS    = {"Supported", "Not Supported"}
 ALL_LANGS = ["en", "de", "es", "fr", "hi"]
 
 # Algo and LLM-method keys — everything else is a judge
-_ALGO_KEYS = {"majority", "owi", "isp", "ds", "MV", "OW-I", "ISP", "Dawid-Skene"}
+_ALGO_KEYS = {
+    "majority", "owi", "isp", "iwmv", "ds", "mace",
+    "MV", "OW-I", "ISP", "IWMV", "Dawid-Skene", "MACE",
+}
 
 
 # ---------------------------------------------------------------------------
