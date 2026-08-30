@@ -192,6 +192,113 @@ a single weighted vote. Unlike IWMV, there is no iteration — it is one pass.
 
 ---
 
+## Dawid-Skene — EM Label Aggregation (Dawid & Skene 1979)
+
+**Function:** `run_dawid_skene(models, matrix, max_iter=100, tol=1e-6)`
+
+**What it computes:** An EM algorithm that jointly estimates, without gold labels:
+- **α_m** (sensitivity): P(judge m votes 1 | true label is 1) — per-judge, per-class
+- **β_m** (specificity): P(judge m votes 0 | true label is 0)
+- **p(y=1 | item i)**: soft posterior probability that item i's true label is 1
+
+Unlike IWMV and OWI, which assign a single accuracy per judge, DS has separate
+sensitivity and specificity — it can detect judges who are biased toward one class
+(e.g., always lean "Supported" regardless of evidence).
+
+**Step by step:**
+
+1. **Initialise soft labels** from majority vote:
+   ```
+   p_y1[i] = 0.8  if majority said 1
+   p_y1[i] = 0.2  if majority said 0
+   p_y1[i] = 0.5  if tied or no valid votes
+   ```
+   Also compute initial `prevalence = mean(p_y1)`.
+
+2. **M-step — estimate α and β per judge:**
+
+   For each judge `m`:
+   ```
+   na = Σ_i  p_y1[i]  ×  𝟙[vote_m[i] == 1]   (expected positives judge said 1)
+   da = Σ_i  p_y1[i]  ×  𝟙[vote_m[i] is valid] (expected positives total)
+
+   nb = Σ_i  (1 - p_y1[i])  ×  𝟙[vote_m[i] == 0]   (expected negatives judge said 0)
+   db = Σ_i  (1 - p_y1[i])  ×  𝟙[vote_m[i] is valid] (expected negatives total)
+
+   α_m = na / da    (clamped to [0.50, 0.99])
+   β_m = nb / db    (clamped to [0.50, 0.99])
+   ```
+   The clamp ensures both parameters stay above chance and below certainty.
+
+3. **Update prevalence:**
+   ```
+   prevalence = mean(p_y1)   (clamped away from 0 and 1)
+   ```
+
+4. **E-step — update soft posterior per item:**
+
+   For each item `i`, accumulate log-posteriors in log-space (stable via shift):
+   ```
+   lp1 = log(prevalence)
+   lp0 = log(1 - prevalence)
+
+   for each judge m with a valid vote:
+       if vote_m[i] == 1:
+           lp1 += log(α_m)          # judge m correctly voted 1
+           lp0 += log(1 - β_m)      # judge m incorrectly voted 1 on a 0 item
+       else:
+           lp1 += log(1 - α_m)      # judge m incorrectly voted 0 on a 1 item
+           lp0 += log(β_m)          # judge m correctly voted 0
+
+   lm = max(lp1, lp0)               # log-sum-exp normalisation
+   p_y1[i] = exp(lp1 - lm) / (exp(lp1 - lm) + exp(lp0 - lm))
+   ```
+
+5. **Convergence check:**
+   ```
+   if max(|p_y1_new[i] - p_y1_old[i]|) < tol:  stop
+   ```
+   Otherwise repeat from step 2. Default `max_iter=100`, `tol=1e-6`.
+
+6. **Hard labels:**
+   ```
+   label[i] = 1    if p_y1[i] > 0.5
+   label[i] = 0    if p_y1[i] < 0.5
+   label[i] = None if p_y1[i] = 0.5 (exact tie, very rare)
+   ```
+
+**Returns:** `(labels, alpha, beta, p_y1_per_sample)`
+
+- `labels`: hard integer label per item
+- `alpha`: `{model: float}` — per-judge sensitivity (P(vote 1 | true 1))
+- `beta`: `{model: float}` — per-judge specificity (P(vote 0 | true 0))
+- `p_y1_per_sample`: `[float]` — final soft posterior P(true label = 1) per item
+
+**Comparison with other methods:**
+
+| Property                    | IWMV                | OWI                  | Dawid-Skene          |
+|-----------------------------|---------------------|----------------------|----------------------|
+| Per-judge weighting         | Yes (overall acc)   | Yes (overall acc)    | Yes (class-specific) |
+| Models class-conditional bias | No                | No                   | Yes                  |
+| Reference for accuracy      | Own soft labels     | ISP pseudo-labels    | EM joint estimate    |
+| Iterations                  | Until convergence   | Single pass          | Until convergence    |
+| Output: per-judge stats     | accuracy + weight   | accuracy + weight    | α (sens) + β (spec)  |
+| Prevalence estimation       | No                  | No                   | Yes (explicit)       |
+
+**Key difference from MACE:** DS models each annotator as having a fixed sensitivity
+and specificity — class-conditional correctness. MACE instead models annotators as
+sometimes randomly spamming (ignoring the item) and sometimes being honest. DS
+captures directional bias (judge always leans Supported); MACE captures engagement
+reliability (judge sometimes ignores the task). See the MACE section for the comparison.
+
+**Observed behavior on MEMERAG:** DS diverges from majority vote on a small fraction
+of items (mostly 4-3 splits), particularly when the three dissenting judges have higher
+estimated reliability. This makes it susceptible to the same failure mode as LLM
+aggregators — when minority judges happen to have been more reliable on easy items,
+their reliability estimate inflates and they can tip 4-3 splits in the wrong direction.
+
+---
+
 ## MACE — Multi-Annotator Competence Estimation (Hovy et al. 2013)
 
 **Function:** `run_mace(models, matrix)` in `utils/mace.py`
