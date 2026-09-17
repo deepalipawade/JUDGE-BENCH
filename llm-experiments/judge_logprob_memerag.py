@@ -42,10 +42,14 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import time
+
 ROOT      = Path(__file__).resolve().parents[1]
 DATA_ROOT = ROOT / "MEMERAG-main" / "data"
 
 CHECKPOINT_EVERY = 5
+MAX_RETRIES      = 3
+RETRY_BASE_DELAY = 2.0  # seconds; doubles each retry
 
 # ── Prompt (identical to judge_memerag.py — no confidence tags) ──────────────
 
@@ -270,51 +274,47 @@ def find_answer_token_step(
 
 def save_output(output_path: Path, header: dict, records: list[dict]) -> None:
     with output_path.open("w", encoding="utf-8") as fh:
-        json.dump({**header, "records": records}, fh, indent=2, ensure_ascii=False)
+        json.dump({**header, "records": list(records)}, fh, indent=2, ensure_ascii=False)
+
+
+def load_existing(output_path: Path) -> dict[str, dict]:
+    """Load existing JSON and return {sample_id: record} dict."""
+    if not output_path.exists():
+        return {}
+    try:
+        with output_path.open("r", encoding="utf-8") as fh:
+            existing = json.load(fh)
+        return {
+            str(r["sample_id"]): r
+            for r in existing.get("records", [])
+            if isinstance(r, dict) and r.get("sample_id")
+        }
+    except Exception as e:
+        print(f"  [resume] Could not load existing output ({e}), starting fresh.")
+        return {}
 
 
 def run_one_model(
     model_name: str,
     candidate_data: list[dict],
-    lang: str,
-    data_file: Path,
+    all_records: dict[str, dict],   # shared {sample_id: record} updated in-place
+    output_path: Path,
+    header: dict,
     no_resume: bool,
     max_new_tokens: int,
     checkpoint_every: int,
 ) -> None:
-    model_slug  = model_name.replace("/", "_").replace(".", "-")
-    output_dir  = ROOT / "results_tmp" / "memerag_ext" / "logprob" / lang
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"logprob_{model_slug}_{lang}.json"
+    # Find samples where this model's output is missing
+    remaining = []
+    for row in candidate_data:
+        sid = str(row["sample_id"])
+        existing_rec = all_records.get(sid, {})
+        if no_resume or model_name not in existing_rec.get("model_outputs", {}):
+            remaining.append(row)
 
-    # ── Resume ───────────────────────────────────────────────────────────────
-    completed: dict[str, dict] = {}
-    if output_path.exists() and not no_resume:
-        try:
-            with output_path.open("r", encoding="utf-8") as fh:
-                existing = json.load(fh)
-            for r in existing.get("records", []):
-                if isinstance(r, dict) and r.get("sample_id"):
-                    completed[str(r["sample_id"])] = r
-            print(f"  [resume] Loaded {len(completed)} completed records.")
-        except Exception as e:
-            print(f"  [resume] Could not load existing output ({e}), starting fresh.")
-
-    remaining = [r for r in candidate_data if str(r["sample_id"]) not in completed]
-    print(f"  Remaining: {len(remaining)}")
-
-    header = {
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "dataset_name": "memerag_ext",
-        "lang":         lang,
-        "model":        model_name,
-        "data_file":    str(data_file),
-        "n_samples":    len(candidate_data),
-    }
-
+    print(f"  Remaining for {model_name}: {len(remaining)}")
     if not remaining:
-        print("  Nothing to do — all samples already completed.")
-        save_output(output_path, header, list(completed.values()))
+        print("  Nothing to do — skipping model load.\n")
         return
 
     # ── Load model ───────────────────────────────────────────────────────────
@@ -335,51 +335,77 @@ def run_one_model(
         sid = str(row["sample_id"])
         print(f"\n  [{idx+1}/{len(remaining)}] {sid}  gold={row['gold_label']}")
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": build_prompt(row)},
-        ]
-        prompt_str = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = tok(prompt_str, return_tensors="pt").to(model.device)
+        label = rationale = raw_text = None
+        step, raw_lp, norm_probs, label_mass = None, {}, {}, 0.0
+        error_msg = None
 
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user",   "content": build_prompt(row)},
+                ]
+                prompt_str = tok.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                inputs = tok(prompt_str, return_tensors="pt").to(model.device)
 
-        prompt_len    = inputs["input_ids"].shape[1]
-        generated_ids = out.sequences[0][prompt_len:].tolist()
-        raw_text      = tok.decode(generated_ids, skip_special_tokens=True)
+                with torch.no_grad():
+                    out = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                    )
 
-        label, rationale = extract_label_and_reason(raw_text)
-        print(f"    label={label}  raw_len={len(raw_text)}")
+                prompt_len    = inputs["input_ids"].shape[1]
+                generated_ids = out.sequences[0][prompt_len:].tolist()
+                raw_text      = tok.decode(generated_ids, skip_special_tokens=True)
+                label, rationale = extract_label_and_reason(raw_text)
 
-        step, raw_lp, norm_probs, label_mass = find_answer_token_step(
-            generated_ids, out.scores, tok, label_token_ids
-        )
+                step, raw_lp, norm_probs, label_mass = find_answer_token_step(
+                    generated_ids, out.scores, tok, label_token_ids
+                )
+                error_msg = None
+                break  # success
 
-        if step is None:
-            print("    [warn] answer token not found — label_mass=0")
+            except Exception as e:
+                error_msg = str(e)
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    print(f"    [retry {attempt}/{MAX_RETRIES}] {type(e).__name__}: {e} — waiting {delay}s")
+                    # free any partial tensors before retry
+                    torch.cuda.empty_cache()
+                    time.sleep(delay)
+                else:
+                    print(f"    [failed after {MAX_RETRIES} attempts] {type(e).__name__}: {e}")
 
-        p_s_norm = norm_probs.get("Supported")
-        if p_s_norm is not None:
-            print(f"    p_supported_norm={p_s_norm:.4f}  label_mass={label_mass:.4f}")
+        if error_msg:
+            print(f"    Skipping sample — saved as error record.")
         else:
-            print("    [no log probs extracted]")
+            p_s_norm = norm_probs.get("Supported")
+            print(f"    label={label}  raw_len={len(raw_text) if raw_text else 0}")
+            if step is None:
+                print("    [warn] answer token not found — label_mass=0")
+            if p_s_norm is not None:
+                print(f"    p_supported_norm={p_s_norm:.4f}  label_mass={label_mass:.4f}")
+            else:
+                print("    [no log probs extracted]")
 
-        completed[sid] = {
-            **{k: row[k] for k in (
-                "sample_id", "query_id", "sentence_id", "query", "answer_segment",
-                "context_texts", "gold_label", "gold_labels_all", "factuality_all",
-                "relevance_all", "fine_grained_factuality_all", "comments_all",
-                "fine_grained_factuality", "relevance", "comments",
-            )},
+        # Merge into shared record (create if first model for this sample)
+        if sid not in all_records:
+            all_records[sid] = {
+                k: row[k] for k in (
+                    "sample_id", "query_id", "sentence_id", "query", "answer_segment",
+                    "context_texts", "gold_label", "gold_labels_all", "factuality_all",
+                    "relevance_all", "fine_grained_factuality_all", "comments_all",
+                    "fine_grained_factuality", "relevance", "comments",
+                )
+            }
+            all_records[sid]["model_outputs"] = {}
+
+        all_records[sid]["model_outputs"][model_name] = {
             "label":                      label,
             "rationale":                  rationale,
             "raw":                        raw_text,
@@ -389,24 +415,30 @@ def run_one_model(
             "p_not_supported_normalized": norm_probs.get("Not Supported"),
             "label_mass":                 label_mass,
             "answer_token_step":          step,
+            "error":                      error_msg,
         }
 
         if (idx + 1) % checkpoint_every == 0:
-            save_output(output_path, header, list(completed.values()))
-            print(f"    [checkpoint] {len(completed)} records → {output_path.name}")
+            save_output(output_path, header, list(all_records.values()))
+            print(f"    [checkpoint] {len(all_records)} records → {output_path.name}")
 
-    save_output(output_path, header, list(completed.values()))
-    print(f"\n  Saved {len(completed)} records → {output_path}")
+    save_output(output_path, header, list(all_records.values()))
 
-    # Summary
-    done    = [r for r in completed.values() if r.get("label") is not None]
-    correct = sum(1 for r in done if r.get("label") == r.get("gold_label"))
+    # Per-model summary
+    done    = [r for r in all_records.values() if model_name in r.get("model_outputs", {})]
+    correct = sum(
+        1 for r in done
+        if r["model_outputs"][model_name].get("label") == r.get("gold_label")
+    )
     if done:
-        print(f"  Accuracy: {correct}/{len(done)} = {correct/len(done)*100:.2f}%")
-    low_mass = [r for r in done if (r.get("label_mass") or 1.0) < 0.3]
+        print(f"\n  {model_name} accuracy: {correct}/{len(done)} = {correct/len(done)*100:.2f}%")
+    low_mass = [
+        r for r in done
+        if (r["model_outputs"][model_name].get("label_mass") or 1.0) < 0.3
+    ]
     print(f"  Low label_mass (<0.30): {len(low_mass)} samples")
 
-    # ── Unload model to free GPU memory ──────────────────────────────────────
+    # ── Unload model ─────────────────────────────────────────────────────────
     del model, tok
     torch.cuda.empty_cache()
     print(f"  Unloaded {model_name}.\n")
@@ -449,19 +481,43 @@ def main() -> None:
     model_list = args.models if args.models else MODELS
     print(f"Models to run ({len(model_list)}): {model_list}\n")
 
+    # ── Shared output file (all models, same structure as memerag_judgement_en.json) ──
+    output_dir  = ROOT / "results_tmp" / "memerag_ext" / "logprob" / args.lang
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"logprob_judgement_{args.lang}.json"
+
+    header = {
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "dataset_name": "memerag_ext",
+        "lang":         args.lang,
+        "models":       model_list,
+        "data_file":    str(data_file),
+        "n_samples":    len(candidate_data),
+    }
+
+    # Load existing records into shared dict {sample_id: record}
+    all_records: dict[str, dict] = {}
+    if not args.no_resume:
+        all_records = load_existing(output_path)
+        print(f"[resume] Loaded {len(all_records)} existing records from {output_path.name}\n")
+
     for model_name in model_list:
         print(f"{'='*60}")
         print(f"Model: {model_name}")
         print(f"{'='*60}")
         run_one_model(
-            model_name      = model_name,
-            candidate_data  = candidate_data,
-            lang            = args.lang,
-            data_file       = data_file,
-            no_resume       = args.no_resume,
-            max_new_tokens  = args.max_new_tokens,
-            checkpoint_every= args.checkpoint_every,
+            model_name       = model_name,
+            candidate_data   = candidate_data,
+            all_records      = all_records,
+            output_path      = output_path,
+            header           = header,
+            no_resume        = args.no_resume,
+            max_new_tokens   = args.max_new_tokens,
+            checkpoint_every = args.checkpoint_every,
         )
+
+    print(f"\nAll done. Final output: {output_path}")
+    print(f"Total records: {len(all_records)}, models covered: {model_list}")
 
 
 if __name__ == "__main__":
