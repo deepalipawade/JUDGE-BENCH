@@ -1,7 +1,7 @@
 """
 judge_logprob_memerag.py
 
-Faithfulness judge using a LOCAL HuggingFace model.
+Faithfulness judge using LOCAL HuggingFace models.
 Runs the same SYSTEM_PROMPT + TASK_PROMPT as judge_memerag.py (rationale + <answer> tags),
 then extracts log-probability confidence at the answer token position.
 
@@ -10,17 +10,23 @@ For each sample it saves:
   - logprob_supported, logprob_not_supported   (raw log-softmax)
   - p_supported_normalized, p_not_supported_normalized  (re-normalised over the two labels)
   - label_mass  (how much probability mass fell on the two labels -- low = model deviated from format)
-  - answer_token_pos  (which generated-token step was the answer label)
+  - answer_token_step  (which generated-token step was the answer label)
+
+Each model's output is saved to its own JSON file. Models are loaded and unloaded
+one at a time to avoid GPU OOM on the cluster.
 
 Usage:
-    # full dataset
-    python judge_logprob_memerag.py --lang en --model Qwen/Qwen2.5-7B-Instruct
+    # run all models in MODELS list
+    python judge_logprob_memerag.py --lang en
 
-    # single sample (good for debugging / supervisor demo)
-    python judge_logprob_memerag.py --lang en --model Qwen/Qwen2.5-7B-Instruct --sample-id 119#s0
+    # run a specific subset
+    python judge_logprob_memerag.py --lang en --models Qwen/Qwen2.5-7B-Instruct Qwen/Qwen2.5-14B-Instruct
 
-    # restart from scratch
-    python judge_logprob_memerag.py --lang en --model Qwen/Qwen2.5-7B-Instruct --no-resume
+    # single sample for debugging / supervisor demo
+    python judge_logprob_memerag.py --lang en --sample-id 119#s0
+
+    # restart a specific model from scratch
+    python judge_logprob_memerag.py --lang en --models Qwen/Qwen2.5-7B-Instruct --no-resume
 """
 from __future__ import annotations
 
@@ -71,6 +77,24 @@ TASK_PROMPT = (
 )
 
 LABELS = ["Supported", "Not Supported"]
+
+# ── Model list ────────────────────────────────────────────────────────────────
+# Edit this list before pushing to the cluster.
+# Gated models (Llama, Gemma) require `huggingface-cli login` on the cluster node.
+MODELS = [
+    "Qwen/Qwen2.5-7B-Instruct",
+    # "Qwen/Qwen2.5-14B-Instruct",
+    # "Qwen/Qwen2.5-32B-Instruct",
+    "microsoft/Phi-4",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    "tiiuae/Falcon3-7B-Instruct",
+    "allenai/OLMo-2-1124-7B-Instruct",
+    "01-ai/Yi-1.5-9B-Chat",
+    "NousResearch/Hermes-3-Llama-3.1-8B",
+    # gated — need HF token:
+    # "meta-llama/Llama-3.1-8B-Instruct",
+    # "google/gemma-2-9b-it",
+]
 
 
 # ── Data loading (same logic as judge_memerag.py) ────────────────────────────
@@ -249,14 +273,154 @@ def save_output(output_path: Path, header: dict, records: list[dict]) -> None:
         json.dump({**header, "records": records}, fh, indent=2, ensure_ascii=False)
 
 
+def run_one_model(
+    model_name: str,
+    candidate_data: list[dict],
+    lang: str,
+    data_file: Path,
+    no_resume: bool,
+    max_new_tokens: int,
+    checkpoint_every: int,
+) -> None:
+    model_slug  = model_name.replace("/", "_").replace(".", "-")
+    output_dir  = ROOT / "results_tmp" / "memerag_ext" / "logprob" / lang
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"logprob_{model_slug}_{lang}.json"
+
+    # ── Resume ───────────────────────────────────────────────────────────────
+    completed: dict[str, dict] = {}
+    if output_path.exists() and not no_resume:
+        try:
+            with output_path.open("r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+            for r in existing.get("records", []):
+                if isinstance(r, dict) and r.get("sample_id"):
+                    completed[str(r["sample_id"])] = r
+            print(f"  [resume] Loaded {len(completed)} completed records.")
+        except Exception as e:
+            print(f"  [resume] Could not load existing output ({e}), starting fresh.")
+
+    remaining = [r for r in candidate_data if str(r["sample_id"]) not in completed]
+    print(f"  Remaining: {len(remaining)}")
+
+    header = {
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "dataset_name": "memerag_ext",
+        "lang":         lang,
+        "model":        model_name,
+        "data_file":    str(data_file),
+        "n_samples":    len(candidate_data),
+    }
+
+    if not remaining:
+        print("  Nothing to do — all samples already completed.")
+        save_output(output_path, header, list(completed.values()))
+        return
+
+    # ── Load model ───────────────────────────────────────────────────────────
+    print(f"  Loading {model_name} ...")
+    tok = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="auto"
+    )
+    model.eval()
+    print(f"  Loaded on: {model.device}")
+
+    print("  Resolving label tokens:")
+    label_tokens    = resolve_label_tokens(tok, LABELS)
+    label_token_ids = {lab: info["token_id"] for lab, info in label_tokens.items()}
+
+    # ── Process samples ──────────────────────────────────────────────────────
+    for idx, row in enumerate(remaining):
+        sid = str(row["sample_id"])
+        print(f"\n  [{idx+1}/{len(remaining)}] {sid}  gold={row['gold_label']}")
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": build_prompt(row)},
+        ]
+        prompt_str = tok.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tok(prompt_str, return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+        prompt_len    = inputs["input_ids"].shape[1]
+        generated_ids = out.sequences[0][prompt_len:].tolist()
+        raw_text      = tok.decode(generated_ids, skip_special_tokens=True)
+
+        label, rationale = extract_label_and_reason(raw_text)
+        print(f"    label={label}  raw_len={len(raw_text)}")
+
+        step, raw_lp, norm_probs, label_mass = find_answer_token_step(
+            generated_ids, out.scores, tok, label_token_ids
+        )
+
+        if step is None:
+            print("    [warn] answer token not found — label_mass=0")
+
+        p_s_norm = norm_probs.get("Supported")
+        if p_s_norm is not None:
+            print(f"    p_supported_norm={p_s_norm:.4f}  label_mass={label_mass:.4f}")
+        else:
+            print("    [no log probs extracted]")
+
+        completed[sid] = {
+            **{k: row[k] for k in (
+                "sample_id", "query_id", "sentence_id", "query", "answer_segment",
+                "context_texts", "gold_label", "gold_labels_all", "factuality_all",
+                "relevance_all", "fine_grained_factuality_all", "comments_all",
+                "fine_grained_factuality", "relevance", "comments",
+            )},
+            "label":                      label,
+            "rationale":                  rationale,
+            "raw":                        raw_text,
+            "logprob_supported":          raw_lp.get("Supported"),
+            "logprob_not_supported":      raw_lp.get("Not Supported"),
+            "p_supported_normalized":     norm_probs.get("Supported"),
+            "p_not_supported_normalized": norm_probs.get("Not Supported"),
+            "label_mass":                 label_mass,
+            "answer_token_step":          step,
+        }
+
+        if (idx + 1) % checkpoint_every == 0:
+            save_output(output_path, header, list(completed.values()))
+            print(f"    [checkpoint] {len(completed)} records → {output_path.name}")
+
+    save_output(output_path, header, list(completed.values()))
+    print(f"\n  Saved {len(completed)} records → {output_path}")
+
+    # Summary
+    done    = [r for r in completed.values() if r.get("label") is not None]
+    correct = sum(1 for r in done if r.get("label") == r.get("gold_label"))
+    if done:
+        print(f"  Accuracy: {correct}/{len(done)} = {correct/len(done)*100:.2f}%")
+    low_mass = [r for r in done if (r.get("label_mass") or 1.0) < 0.3]
+    print(f"  Low label_mass (<0.30): {len(low_mass)} samples")
+
+    # ── Unload model to free GPU memory ──────────────────────────────────────
+    del model, tok
+    torch.cuda.empty_cache()
+    print(f"  Unloaded {model_name}.\n")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Log-prob faithfulness judge (local HF model)")
+    parser = argparse.ArgumentParser(description="Log-prob faithfulness judge (local HF models)")
     parser.add_argument("--lang",      default="en",  help="Language code (default: en)")
-    parser.add_argument("--model",     required=True, help="HuggingFace model name or local path")
+    parser.add_argument("--models",    nargs="+", default=None,
+                        help="Model(s) to run. Defaults to full MODELS list in script.")
     parser.add_argument("--sample-id", default=None,  help="Run a single sample by ID (e.g. 119#s0)")
     parser.add_argument("--samples",   type=int, default=None, help="Random subset size")
     parser.add_argument("--no-resume", action="store_true",    help="Start fresh, ignore existing output")
-    parser.add_argument("--max-new-tokens", type=int, default=512, help="Max tokens to generate (default 512)")
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY)
     args = parser.parse_args()
 
@@ -280,144 +444,24 @@ def main() -> None:
     else:
         candidate_data = all_data
 
-    print(f"Samples to process: {len(candidate_data)}")
+    print(f"Dataset: {len(candidate_data)} samples  ({data_file.name})")
 
-    # ── Output path ──────────────────────────────────────────────────────────
-    model_slug   = args.model.replace("/", "_").replace(".", "-")
-    output_dir   = ROOT / "results_tmp" / "memerag_ext" / "logprob" / args.lang
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path  = output_dir / f"logprob_{model_slug}_{args.lang}.json"
+    model_list = args.models if args.models else MODELS
+    print(f"Models to run ({len(model_list)}): {model_list}\n")
 
-    # ── Resume ───────────────────────────────────────────────────────────────
-    completed: dict[str, dict] = {}
-    if output_path.exists() and not args.no_resume:
-        try:
-            with output_path.open("r", encoding="utf-8") as fh:
-                existing = json.load(fh)
-            for r in existing.get("records", []):
-                if isinstance(r, dict) and r.get("sample_id"):
-                    completed[str(r["sample_id"])] = r
-            print(f"[resume] Loaded {len(completed)} completed records.")
-        except Exception as e:
-            print(f"[resume] Could not load existing output ({e}), starting fresh.")
-
-    remaining = [r for r in candidate_data if str(r["sample_id"]) not in completed]
-    print(f"Remaining: {len(remaining)}")
-
-    header = {
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "dataset_name": "memerag_ext",
-        "lang":         args.lang,
-        "model":        args.model,
-        "data_file":    str(data_file),
-        "n_samples":    len(candidate_data),
-    }
-
-    if not remaining:
-        print("Nothing to do — all samples already completed.")
-        save_output(output_path, header, list(completed.values()))
-        return
-
-    # ── Load model ───────────────────────────────────────────────────────────
-    print(f"\nLoading {args.model} ...")
-    tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map="auto"
-    )
-    model.eval()
-    print(f"Loaded on: {model.device}")
-
-    print("\nResolving label tokens:")
-    label_tokens   = resolve_label_tokens(tok, LABELS)
-    label_token_ids = {lab: info["token_id"] for lab, info in label_tokens.items()}
-
-    # ── Process samples ──────────────────────────────────────────────────────
-    records = list(completed.values())
-
-    for idx, row in enumerate(remaining):
-        sid = str(row["sample_id"])
-        print(f"\n[{idx+1}/{len(remaining)}] {sid}  gold={row['gold_label']}")
-
-        user_content = build_prompt(row)
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
-        ]
-        prompt_str = tok.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+    for model_name in model_list:
+        print(f"{'='*60}")
+        print(f"Model: {model_name}")
+        print(f"{'='*60}")
+        run_one_model(
+            model_name      = model_name,
+            candidate_data  = candidate_data,
+            lang            = args.lang,
+            data_file       = data_file,
+            no_resume       = args.no_resume,
+            max_new_tokens  = args.max_new_tokens,
+            checkpoint_every= args.checkpoint_every,
         )
-        inputs = tok(prompt_str, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
-
-        # Decode generated text (after prompt)
-        prompt_len    = inputs["input_ids"].shape[1]
-        generated_ids = out.sequences[0][prompt_len:].tolist()
-        raw_text      = tok.decode(generated_ids, skip_special_tokens=True)
-
-        label, rationale = extract_label_and_reason(raw_text)
-        print(f"  label={label}  raw_len={len(raw_text)}")
-
-        # Find answer token in generation and extract log probs
-        step, raw_lp, norm_probs, label_mass = find_answer_token_step(
-            generated_ids, out.scores, tok, label_token_ids
-        )
-
-        if step is None:
-            print(f"  [warn] answer token not found in generated sequence — label_mass=0")
-
-        logprob_s  = raw_lp.get("Supported",     None)
-        logprob_ns = raw_lp.get("Not Supported",  None)
-        p_s_norm   = norm_probs.get("Supported",    None)
-        p_ns_norm  = norm_probs.get("Not Supported", None)
-
-        print(f"  p_supported_norm={p_s_norm:.4f}  label_mass={label_mass:.4f}" if p_s_norm is not None else "  [no log probs]")
-
-        record = {
-            **{k: row[k] for k in (
-                "sample_id", "query_id", "sentence_id", "query", "answer_segment",
-                "context_texts", "gold_label", "gold_labels_all", "factuality_all",
-                "relevance_all", "fine_grained_factuality_all", "comments_all",
-                "fine_grained_factuality", "relevance", "comments",
-            )},
-            "label":                      label,
-            "rationale":                  rationale,
-            "raw":                        raw_text,
-            "logprob_supported":          logprob_s,
-            "logprob_not_supported":      logprob_ns,
-            "p_supported_normalized":     p_s_norm,
-            "p_not_supported_normalized": p_ns_norm,
-            "label_mass":                 label_mass,
-            "answer_token_step":          step,
-        }
-
-        completed[sid] = record
-        records.append(record)
-
-        if (idx + 1) % args.checkpoint_every == 0:
-            save_output(output_path, header, list(completed.values()))
-            print(f"  [checkpoint] saved {len(completed)} records → {output_path}")
-
-    save_output(output_path, header, list(completed.values()))
-    print(f"\nDone. Saved {len(completed)} records → {output_path}")
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    done = [r for r in completed.values() if r.get("label") is not None]
-    correct = sum(
-        1 for r in done
-        if r.get("label") == r.get("gold_label")
-    )
-    print(f"\nAccuracy (label match): {correct}/{len(done)} = {correct/len(done)*100:.2f}%")
-
-    low_mass = [r for r in done if (r.get("label_mass") or 1.0) < 0.3]
-    print(f"Low label_mass (<0.30) samples: {len(low_mass)} — format violations, treat log probs with care")
 
 
 if __name__ == "__main__":
