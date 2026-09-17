@@ -293,8 +293,12 @@ def run_dawid_skene(
     if init_p_y1 is not None:
         p_y1: list[float] = list(init_p_y1)
     else:
-        mv = _majority_vote(_votes_by_sample(models, matrix))
-        p_y1 = [0.8 if v == 1 else (0.2 if v == 0 else 0.5) for v in mv]
+        votes_by_sample = _votes_by_sample(models, matrix)
+        p_y1 = []
+        for vs in votes_by_sample:
+            valid = [v for v in vs if v is not None]
+            frac = sum(valid) / len(valid) if valid else 0.5
+            p_y1.append(max(0.05, min(0.95, frac)))
     prevalence = sum(p_y1) / n
     alpha: dict[str, float] = {m: 0.8 for m in models}
     beta:  dict[str, float] = {m: 0.8 for m in models}
