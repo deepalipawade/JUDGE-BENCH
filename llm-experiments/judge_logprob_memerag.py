@@ -86,10 +86,15 @@ LABELS = ["Supported", "Not Supported"]
 # Edit this list before pushing to the cluster.
 # Gated models (Llama, Gemma) require `huggingface-cli login` on the cluster node.
 MODELS = [
-    "Qwen/Qwen2.5-7B-Instruct",
+    # "Qwen/Qwen2.5-7B-Instruct", # Qwen 3 or more
     # "Qwen/Qwen2.5-14B-Instruct",
     # "Qwen/Qwen2.5-32B-Instruct",
+    "Qwen/Qwen3-8B", #qwen thinking disabled
+    "meta-llama/Llama-3.1-8B-Instruct",
     "microsoft/Phi-4",
+    "google/gemma-2-9b-it",
+    "microsoft/Phi-4-mini-instruct",
+
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
     "tiiuae/Falcon3-7B-Instruct",
     "allenai/OLMo-2-1124-7B-Instruct",
@@ -244,27 +249,45 @@ def find_answer_token_step(
     label_token_ids: dict[str, int],
 ) -> tuple[int | None, dict[str, float], dict[str, float], float]:
     """
-    Scan generated tokens to find the first one that is a label token.
-    Returns (step_index, raw_logprobs, normalized_probs, label_mass).
-    step_index is None if no label token was found (format violation).
+    Find the generation step where the label word begins inside <answer> tags.
+
+    Uses incremental text decoding instead of token-ID matching, so it works
+    regardless of how the tokenizer splits "Supported" or "Not" after the
+    closing > of <answer> (context-dependent BPE boundaries).
+
+    Falls back to scanning for the label token anywhere in the sequence if no
+    <answer> tag is present (handles models that skip the tag format).
     """
+    # Pass 1: look for label immediately after <answer> tag (preferred)
+    cumulative = ""
+    for step, token_id in enumerate(generated_ids):
+        piece = tok.decode([token_id], skip_special_tokens=False)
+        cumulative += piece
+        lo = cumulative.lower()
+        if "<answer>" not in lo:
+            continue
+        after = lo[lo.rfind("<answer>") + len("<answer>"):].lstrip()
+        if after.startswith("sup") or after.startswith("not"):
+            logits    = scores[step][0]
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            raw_lp    = {l: log_probs[label_token_ids[l]].item() for l in label_token_ids}
+            label_logits = torch.stack([logits[t] for t in label_token_ids.values()]).float()
+            normed       = torch.softmax(label_logits, dim=-1).tolist()
+            norm_probs   = dict(zip(label_token_ids.keys(), normed))
+            label_mass   = sum(torch.tensor(lp).exp().item() for lp in raw_lp.values())
+            return step, raw_lp, norm_probs, label_mass
+
+    # Pass 2: fallback — exact token-ID scan (original behaviour, handles bare-label prompts)
     for step, token_id in enumerate(generated_ids):
         for lab, tid in label_token_ids.items():
             if token_id == tid:
-                # Found the answer token — extract the distribution at this step
-                logits    = scores[step][0]  # shape: (vocab,)
+                logits    = scores[step][0]
                 log_probs = torch.log_softmax(logits.float(), dim=-1)
-
-                raw_lp: dict[str, float] = {}
-                for l2, t2 in label_token_ids.items():
-                    raw_lp[l2] = log_probs[t2].item()
-
-                # Re-normalise over the two label tokens
+                raw_lp    = {l2: log_probs[t2].item() for l2, t2 in label_token_ids.items()}
                 label_logits = torch.stack([logits[t] for t in label_token_ids.values()]).float()
                 normed       = torch.softmax(label_logits, dim=-1).tolist()
                 norm_probs   = dict(zip(label_token_ids.keys(), normed))
-
-                label_mass = sum(torch.tensor(lp).exp().item() for lp in raw_lp.values())
+                label_mass   = sum(torch.tensor(lp).exp().item() for lp in raw_lp.values())
                 return step, raw_lp, norm_probs, label_mass
 
     return None, {}, {}, 0.0
@@ -345,9 +368,18 @@ def run_one_model(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": build_prompt(row)},
                 ]
-                prompt_str = tok.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                # Qwen3 models have thinking mode on by default; disable it so the
+                # model outputs the label directly without <think> blocks.
+                try:
+                    prompt_str = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                except TypeError:
+                    # Other tokenizers don't accept enable_thinking — fall back
+                    prompt_str = tok.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
                 inputs = tok(prompt_str, return_tensors="pt").to(model.device)
 
                 with torch.no_grad():
