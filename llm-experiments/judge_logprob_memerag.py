@@ -148,6 +148,58 @@ TASK_PROMPT_RATIONALE = (
     "Provide your rationale, label, and confidence using the tags specified above."
 )
 
+# --chain mode: initial answer → rationale → final answer → confidence
+# Pre-reasoning logprob at <answer_initial>; post-reasoning logprob at <answer>.
+# Flip detection: answer_initial != answer.
+SYSTEM_PROMPT_CHAIN = (
+    "Given a set of evidence passages, and an answer, determine if the answer is fully "
+    "supported by the evidence passages or not. "
+    "Analyze each sentence of the answer carefully and verify that all information it "
+    "contains is explicitly stated in or can be directly inferred from the evidence passages.\n\n"
+    "Output Not Supported if ANY of the following are true:\n\n"
+    "The answer contains any information not explicitly stated in or directly inferable from the passages.\n"
+    "The answer contradicts any information in the passages.\n"
+    "The answer introduces any new information not found in the passages.\n"
+    "The answer misrepresents or inaccurately paraphrases information from the passages.\n"
+    "The answer draws conclusions not logically supported by the given information.\n"
+    "The answer changes the level of certainty, specificity, or nuance from what is expressed in the passages.\n"
+    "The answer does not directly address the specific aspect asked about in the question.\n"
+    "The answer conflates or misrepresents separate pieces of information when summarizing multiple passages.\n\n"
+    "Output Supported otherwise.\n\n"
+    "Express your confidence based on EVIDENCE QUALITY in the passages, not on how certain you feel about your label.\n"
+    "If the answer has multiple sentences with different evidence quality, base your confidence on "
+    "whichever sentence most drove your final label — typically the weakest-supported sentence if the "
+    "label is Not Supported, or the least-direct sentence if the label is Supported. Do not average across sentences.\n"
+    "Output exactly one of these three fixed scores — do not interpolate:\n\n"
+    "  High   → <confidence>High</confidence>   <confidence_score>0.95</confidence_score>\n"
+    "           At least one passage directly and explicitly addresses the decisive sentence/claim\n"
+    "           (confirms or refutes it with clear textual evidence).\n\n"
+    "  Medium → <confidence>Medium</confidence> <confidence_score>0.65</confidence_score>\n"
+    "           Passages are topically relevant but the link requires inference or paraphrasing.\n\n"
+    "  Low    → <confidence>Low</confidence>    <confidence_score>0.35</confidence_score>\n"
+    "           No passage addresses the specific claim — your label is a best guess.\n\n"
+    "Output format (always all five tags, in this order):\n"
+    "1. Your initial label BEFORE reasoning (gut decision):\n"
+    "   <answer_initial>Supported OR Not Supported</answer_initial>\n\n"
+    "2. Your reasoning through the evidence:\n"
+    "   <rationale>...</rationale>\n\n"
+    "3. Your final label — you MAY revise your initial answer if reasoning changes your mind:\n"
+    "   <answer>Supported OR Not Supported</answer>\n\n"
+    "4. Your confidence based on EVIDENCE QUALITY:\n"
+    "   <confidence>High OR Medium OR Low</confidence>\n"
+    "   <confidence_score>0.95 OR 0.65 OR 0.35</confidence_score>\n"
+)
+
+TASK_PROMPT_CHAIN = (
+    "Evidence Passages:\n\n"
+    "{context}\n\n"
+    "Question:\n"
+    "{query}\n\n"
+    "Answer:\n"
+    "{answer_segment}\n\n"
+    "Provide your initial label, rationale, final label, and confidence using the tags specified above."
+)
+
 LABELS = ["Supported", "Not Supported"]
 
 # ── Model list ────────────────────────────────────────────────────────────────
@@ -280,6 +332,27 @@ def extract_label_bare(text: str | None) -> tuple[str | None, str | None]:
     return None, None
 
 
+def extract_label_chain(text: str | None) -> tuple[str | None, str | None, str | None, str | None, float | None]:
+    """Extract initial label, final label, rationale, confidence, confidence_score from chain output."""
+    if not text:
+        return None, None, None, None, None
+    m_init = re.search(r"<answer_initial>\s*(supported|not supported)\s*</answer_initial>", text, re.IGNORECASE)
+    label_initial = normalize_label(m_init.group(1)) if m_init else None
+    m_final = re.search(r"<answer>\s*(supported|not supported)\s*</answer>", text, re.IGNORECASE)
+    if m_final:
+        label_final = normalize_label(m_final.group(1))
+    else:
+        lo = text.lower()
+        label_final = "Not Supported" if "not supported" in lo else ("Supported" if "supported" in lo else None)
+    rm = re.search(r"<rationale>(.*?)</rationale>", text, re.IGNORECASE | re.DOTALL)
+    rationale = rm.group(1).strip() if rm else None
+    cm = re.search(r"<confidence>\s*(high|medium|low)\s*</confidence>", text, re.IGNORECASE)
+    confidence = cm.group(1).capitalize() if cm else None
+    sm = re.search(r"<confidence_score>\s*([0-9.]+)\s*</confidence_score>", text, re.IGNORECASE)
+    confidence_score = float(sm.group(1)) if sm else None
+    return label_initial, label_final, rationale, confidence, confidence_score
+
+
 def extract_label_rationale(text: str | None) -> tuple[str | None, str | None, str | None, float | None]:
     """Extract label, rationale, verbalized confidence, and confidence score from tagged output."""
     if not text:
@@ -343,22 +416,25 @@ def find_answer_token_step(
     scores: tuple[torch.Tensor, ...],
     tok: Any,
     label_token_ids: dict[str, int],
+    tag: str = "<answer>",
 ) -> tuple[int | None, dict[str, float], dict[str, float], float]:
     """
-    Find the step where the label word begins inside <answer> tags.
-    Used in --rationale mode: decodes tokens incrementally and triggers
-    at the step where text after <answer> starts with 'sup' or 'not',
-    avoiding context-dependent BPE token-ID mismatches.
-    Falls back to exact token-ID scan if no <answer> tag is present.
+    Find the step where the label word begins inside the given tag.
+    Used in --rationale and --chain modes. Decodes tokens incrementally
+    and triggers at the step where text after `tag` starts with 'sup' or 'not'.
+    Falls back to exact token-ID scan if the tag is not found.
+    `tag` should be '<answer>' (default) or '<answer_initial>' for chain mode.
     """
+    tag_lo  = tag.lower()
+    tag_len = len(tag_lo)
     cumulative = ""
     for step, token_id in enumerate(generated_ids):
         piece = tok.decode([token_id], skip_special_tokens=False)
         cumulative += piece
         lo = cumulative.lower()
-        if "<answer>" not in lo:
+        if tag_lo not in lo:
             continue
-        after = lo[lo.rfind("<answer>") + len("<answer>"):].lstrip()
+        after = lo[lo.rfind(tag_lo) + tag_len:].lstrip()
         if after.startswith("sup") or after.startswith("not"):
             logits    = scores[step][0]
             log_probs = torch.log_softmax(logits.float(), dim=-1)
@@ -409,6 +485,33 @@ def load_existing(output_path: Path) -> dict[str, dict]:
         return {}
 
 
+def apply_chat_template_safe(tok: Any, messages: list[dict]) -> str:
+    """
+    Apply chat template with two fallbacks:
+    1. TypeError  → enable_thinking not supported (non-Qwen models); retry without it.
+    2. TemplateError / 'system' in error → system role not supported (Gemma etc.);
+       merge system prompt into the user turn and retry.
+    """
+    for use_thinking in (True, False):
+        kwargs = {"enable_thinking": False} if use_thinking else {}
+        for merge_system in (False, True):
+            msgs = messages
+            if merge_system:
+                merged = messages[0]["content"] + "\n\n" + messages[1]["content"]
+                msgs = [{"role": "user", "content": merged}]
+            try:
+                return tok.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True, **kwargs
+                )
+            except TypeError:
+                break  # enable_thinking not supported → try without it
+            except Exception as e:
+                if "system" in str(e).lower():
+                    continue  # system role not supported → try merged
+                raise
+    raise RuntimeError("apply_chat_template failed with all fallback attempts")
+
+
 def run_one_model(
     model_name: str,
     candidate_data: list[dict],
@@ -419,6 +522,7 @@ def run_one_model(
     max_new_tokens: int,
     checkpoint_every: int,
     use_rationale: bool = False,
+    use_chain: bool = False,
 ) -> None:
     # Find samples where this model's output is missing
     remaining = []
@@ -442,9 +546,18 @@ def run_one_model(
     model.eval()
     print(f"  Loaded on: {model.device}")
 
-    system_prompt = SYSTEM_PROMPT_RATIONALE if use_rationale else SYSTEM_PROMPT_BARE
-    task_prompt   = TASK_PROMPT_RATIONALE   if use_rationale else TASK_PROMPT_BARE
-    mode_label    = "rationale" if use_rationale else "bare-label"
+    if use_chain:
+        system_prompt = SYSTEM_PROMPT_CHAIN
+        task_prompt   = TASK_PROMPT_CHAIN
+        mode_label    = "chain"
+    elif use_rationale:
+        system_prompt = SYSTEM_PROMPT_RATIONALE
+        task_prompt   = TASK_PROMPT_RATIONALE
+        mode_label    = "rationale"
+    else:
+        system_prompt = SYSTEM_PROMPT_BARE
+        task_prompt   = TASK_PROMPT_BARE
+        mode_label    = "bare-label"
     print(f"  Mode: {mode_label}")
 
     print("  Resolving label tokens:")
@@ -457,8 +570,10 @@ def run_one_model(
         print(f"\n  [{idx+1}/{len(remaining)}] {sid}  gold={row['gold_label']}")
 
         label = rationale = raw_text = None
+        label_initial = None
         confidence = confidence_score = None
         step, raw_lp, norm_probs, label_mass = None, {}, {}, 0.0
+        step_initial, raw_lp_initial, norm_probs_initial, label_mass_initial = None, {}, {}, 0.0
         error_msg = None
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -473,17 +588,7 @@ def run_one_model(
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_content},
                 ]
-                # Qwen3 has thinking mode on by default; disable so there's no
-                # <think> block before the label/rationale.
-                try:
-                    prompt_str = tok.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True,
-                        enable_thinking=False,
-                    )
-                except TypeError:
-                    prompt_str = tok.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
+                prompt_str = apply_chat_template_safe(tok, messages)
                 inputs = tok(prompt_str, return_tensors="pt").to(model.device)
 
                 with torch.no_grad():
@@ -499,7 +604,19 @@ def run_one_model(
                 generated_ids = out.sequences[0][prompt_len:].tolist()
                 raw_text      = tok.decode(generated_ids, skip_special_tokens=True)
 
-                if use_rationale:
+                if use_chain:
+                    label_initial, label, rationale, confidence, confidence_score = extract_label_chain(raw_text)
+                    step_initial, raw_lp_initial, norm_probs_initial, label_mass_initial = find_answer_token_step(
+                        generated_ids, out.scores, tok, label_token_ids, tag="<answer_initial>"
+                    )
+                    step, raw_lp, norm_probs, label_mass = find_answer_token_step(
+                        generated_ids, out.scores, tok, label_token_ids, tag="<answer>"
+                    )
+                    if step_initial is None:
+                        print("    [warn] <answer_initial> token not found")
+                    if step is None:
+                        print("    [warn] <answer> (final) token not found")
+                elif use_rationale:
                     label, rationale, confidence, confidence_score = extract_label_rationale(raw_text)
                     step, raw_lp, norm_probs, label_mass = find_answer_token_step(
                         generated_ids, out.scores, tok, label_token_ids
@@ -529,7 +646,14 @@ def run_one_model(
             print(f"    Skipping sample — saved as error record.")
         else:
             p_s_norm = norm_probs.get("Supported")
-            print(f"    label={label}  raw_len={len(raw_text) if raw_text else 0}")
+            if use_chain and label_initial is not None:
+                flip = label_initial != label if (label_initial and label) else None
+                p_init = norm_probs_initial.get("Supported")
+                print(f"    label_initial={label_initial}  label={label}  flipped={flip}  raw_len={len(raw_text) if raw_text else 0}")
+                if p_init is not None:
+                    print(f"    p_supported_initial={p_init:.4f}  label_mass_initial={label_mass_initial:.4f}")
+            else:
+                print(f"    label={label}  raw_len={len(raw_text) if raw_text else 0}")
             if p_s_norm is not None:
                 print(f"    p_supported_norm={p_s_norm:.4f}  label_mass={label_mass:.4f}")
                 if label_mass < 0.3:
@@ -547,7 +671,7 @@ def run_one_model(
             }
             all_records[sid]["model_outputs"] = {}
 
-        all_records[sid]["model_outputs"][model_name] = {
+        out_rec = {
             "label":                      label,
             "rationale":                  rationale,
             "verbalized_confidence":      confidence,
@@ -561,6 +685,18 @@ def run_one_model(
             "answer_token_step":          step,
             "error":                      error_msg,
         }
+        if use_chain:
+            out_rec.update({
+                "label_initial":                      label_initial,
+                "flipped":                            (label_initial != label) if (label_initial and label) else None,
+                "logprob_supported_initial":          raw_lp_initial.get("Supported"),
+                "logprob_not_supported_initial":      raw_lp_initial.get("Not Supported"),
+                "p_supported_normalized_initial":     norm_probs_initial.get("Supported"),
+                "p_not_supported_normalized_initial": norm_probs_initial.get("Not Supported"),
+                "label_mass_initial":                 label_mass_initial or None,
+                "answer_initial_token_step":          step_initial,
+            })
+        all_records[sid]["model_outputs"][model_name] = out_rec
 
         if (idx + 1) % checkpoint_every == 0:
             save_output(output_path, header, list(all_records.values()))
@@ -597,8 +733,11 @@ def main() -> None:
     parser.add_argument("--samples",   type=int, default=None, help="Random subset size")
     parser.add_argument("--no-resume", action="store_true",    help="Start fresh, ignore existing output")
     parser.add_argument("--rationale", action="store_true",
-                        help="Use rationale+<answer> prompt and scan for label inside <answer> tag. "
-                             "Default (without flag): bare-label prompt, logprob at step 0.")
+                        help="rationale → answer → confidence. Logprob at <answer> step (post-reasoning).")
+    parser.add_argument("--chain", action="store_true",
+                        help="answer_initial → rationale → answer → confidence. "
+                             "Pre-reasoning logprob at <answer_initial>, post-reasoning at <answer>. "
+                             "Enables flip detection (initial != final label).")
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--checkpoint-every", type=int, default=CHECKPOINT_EVERY)
     args = parser.parse_args()
@@ -633,18 +772,29 @@ def main() -> None:
     # --rationale mode → logprob_judgement_{lang}_rationale.json
     output_dir  = ROOT / "results_tmp" / "memerag_ext" / "logprob" / args.lang
     output_dir.mkdir(parents=True, exist_ok=True)
-    suffix      = "_rationale" if args.rationale else ""
+    if args.chain:
+        suffix = "_chain"
+    elif args.rationale:
+        suffix = "_rationale"
+    else:
+        suffix = ""
     output_path = output_dir / f"logprob_judgement_{args.lang}{suffix}.json"
 
-    mode_str = "rationale+<answer>" if args.rationale else "bare-label (step 0)"
+    if args.chain:
+        mode_str = "chain (answer_initial → rationale → answer → confidence)"
+    elif args.rationale:
+        mode_str = "rationale → answer → confidence"
+    else:
+        mode_str = "bare-label (step 0)"
     print(f"Mode: {mode_str}")
     print(f"Output: {output_path}\n")
 
+    mode_val = "chain" if args.chain else ("rationale" if args.rationale else "bare-label")
     header = {
         "timestamp":    datetime.now(timezone.utc).isoformat(),
         "dataset_name": "memerag_ext",
         "lang":         args.lang,
-        "mode":         "rationale" if args.rationale else "bare-label",
+        "mode":         mode_val,
         "models":       model_list,
         "data_file":    str(data_file),
         "n_samples":    len(candidate_data),
@@ -670,6 +820,7 @@ def main() -> None:
             max_new_tokens   = args.max_new_tokens,
             checkpoint_every = args.checkpoint_every,
             use_rationale    = args.rationale,
+            use_chain        = args.chain,
         )
 
     print(f"\nAll done. Final output: {output_path}")
