@@ -282,26 +282,53 @@ def extract_rating_chain(
 
 def resolve_rating_tokens(tok: Any, labels: list[str]) -> dict[str, dict]:
     """
-    First token id for each rating digit, trying both '1' and ' 1'.
+    Map each rating digit to the token id the model would actually emit.
 
-    Digits are usually single tokens, but the leading-space variant differs by
-    tokenizer and MATTERS: the id we pick must be the one the model would
-    actually emit in that position. With --prefill ('Rating: ') the model emits
-    the space-prefixed form on most tokenizers; without it, at step 0 after a
-    chat template, the bare form is typical. We pick the shortest encoding and
-    print both so a pilot run can confirm.
+    IMPORTANT: do not blindly take ids[0]. SentencePiece tokenizers (Mistral and
+    others) prepend a whitespace-marker token when encoding a bare string, so
+    ids[0] is the SAME for every digit. Five identical ids means softmaxing five
+    copies of one logit, which yields a perfectly uniform 0.2/0.2/0.2/0.2/0.2
+    "distribution" - plausible-looking and completely meaningless.
+
+    So: find the first position at which the five encodings actually differ, and
+    hard-fail if no such position exists rather than emitting junk.
     """
-    resolved = {}
+    encs: dict[str, tuple[str, list[int]]] = {}
     for label in labels:
-        best = None
+        cands = []
         for variant in (label, " " + label):
             ids = tok.encode(variant, add_special_tokens=False)
-            if ids and (best is None or len(ids) < len(best[1])):
-                best = (variant, ids)
-        resolved[label] = {"variant": best[0], "token_id": best[1][0]}
-        alt = tok.encode(" " + label, add_special_tokens=False)
-        print(f"    {label!r} -> first token {best[0]!r} (id {best[1][0]})"
-              f"   [space-variant first id: {alt[0] if alt else None}]")
+            if ids:
+                cands.append((variant, ids))
+        if not cands:
+            raise RuntimeError(f"Tokenizer produced no ids for {label!r}")
+        encs[label] = min(cands, key=lambda c: len(c[1]))
+
+    for label, (variant, ids) in encs.items():
+        print(f"    {label!r:4s} encodes as {ids}  (variant {variant!r})")
+
+    max_len = max(len(ids) for _, ids in encs.values())
+    pos = None
+    for i in range(max_len):
+        at_i = [ids[i] for _, ids in encs.values() if i < len(ids)]
+        if len(at_i) == len(labels) and len(set(at_i)) == len(labels):
+            pos = i
+            break
+
+    if pos is None:
+        raise RuntimeError(
+            "Could not find a token position where all rating digits differ.\n"
+            f"  encodings: { {l: ids for l, (_, ids) in encs.items()} }\n"
+            "  Using these ids would produce a uniform, meaningless distribution."
+        )
+    if pos != 0:
+        print(f"    [note] token position 0 is shared across digits "
+              f"(tokenizer prefix) - using position {pos} instead")
+
+    resolved = {}
+    for label, (variant, ids) in encs.items():
+        resolved[label] = {"variant": variant, "token_id": ids[pos], "position": pos}
+    print(f"    resolved ids: { {l: r['token_id'] for l, r in resolved.items()} }")
     return resolved
 
 
@@ -588,7 +615,10 @@ def run_one_model(
             print(f"    rating={rating}  E[r]={der['expected_rating']}  "
                   f"H={der['entropy_norm']}  mass={label_mass:.4f}")
             print(f"    p: {dist}")
-            if label_mass < 0.30:
+            if label_mass > 1.001:
+                print(f"    [ERROR] label_mass={label_mass:.4f} exceeds 1.0 - the rating token "
+                      "ids are not distinct, so this distribution is meaningless.")
+            elif label_mass < 0.30:
                 print("    [warn] LOW label_mass - model likely did not emit a bare digit here. "
                       "If this is common, rerun with --prefill.")
             if raw_text is not None and not raw_text.strip()[:1].isdigit() and not (use_chain or use_rationale):
