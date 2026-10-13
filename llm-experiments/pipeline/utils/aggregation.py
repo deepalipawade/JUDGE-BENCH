@@ -78,6 +78,48 @@ def run_majority(
 
 
 # ---------------------------------------------------------------------------
+# Weighted Majority Vote  (uses verbalized confidence_score as vote weight)
+# ---------------------------------------------------------------------------
+
+def run_weighted_majority(
+    models: list[str],
+    matrix: dict[str, list[int | None]],
+    confidence_scores: dict[str, list[float | None]],
+) -> list[int | None]:
+    """Weighted majority vote using confidence_score as vote weight.
+
+    For each sample, each model's vote is weighted by its confidence_score.
+    Falls back to weight=0.5 when score is None (equivalent to a half-vote,
+    preserving relative ordering vs. high-confidence votes).
+    Ties broken by first valid vote (same as run_majority).
+    """
+    n = len(next(iter(matrix.values())))
+    labels: list[int | None] = []
+    for i in range(n):
+        w0 = w1 = 0.0
+        first_valid: int | None = None
+        for m in models:
+            v = matrix[m][i]
+            if v is None:
+                continue
+            if first_valid is None:
+                first_valid = v
+            scores = confidence_scores.get(m, [])
+            w = scores[i] if i < len(scores) and scores[i] is not None else 0.5
+            if v == 1:
+                w1 += w
+            else:
+                w0 += w
+        if w1 > w0:
+            labels.append(1)
+        elif w0 > w1:
+            labels.append(0)
+        else:
+            labels.append(first_valid)
+    return labels
+
+
+# ---------------------------------------------------------------------------
 # IWMV  (Iterative Weighted Majority Vote — previously mislabeled as ISP)
 # ---------------------------------------------------------------------------
 

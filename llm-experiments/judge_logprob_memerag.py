@@ -1,5 +1,5 @@
-"""
-judge_logprob_memerag.py
+ """
+ judge_logprob_memerag.py
 
 Faithfulness judge using LOCAL HuggingFace models.
 Extracts log-probability confidence at the label decision point.
@@ -215,13 +215,13 @@ MODELS = [
     # gated — need HF token:
     "meta-llama/Llama-3.1-8B-Instruct", #gated
     "google/gemma-2-9b-it", #gated
-
     # "microsoft/Phi-4-mini-instruct",
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
     # "CohereForAI/c4ai-command-r-v01",
+    # "CohereForAI/c4ai-command-r7b-12-2024",  # gated repo
     # "allenai/OLMo-7B-Instruct",
-    # "tiiuae/Falcon3-7B-Instruct",
-    # "allenai/OLMo-2-1124-7B-Instruct",
+     "tiiuae/Falcon3-7B-Instruct",
+     "allenai/OLMo-2-1124-7B-Instruct",
     # "01-ai/Yi-1.5-9B-Chat",
     # "NousResearch/Hermes-3-Llama-3.1-8B",
 ]
@@ -529,7 +529,8 @@ def run_one_model(
     for row in candidate_data:
         sid = str(row["sample_id"])
         existing_rec = all_records.get(sid, {})
-        if no_resume or model_name not in existing_rec.get("model_outputs", {}):
+        existing_out = existing_rec.get("model_outputs", {}).get(model_name, {})
+        if no_resume or model_name not in existing_rec.get("model_outputs", {}) or existing_out.get("label") is None:
             remaining.append(row)
 
     print(f"  Remaining for {model_name}: {len(remaining)}")
